@@ -1,0 +1,43 @@
+name: Test and package
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      DSH_RELAY_TEST_HOME: ${{ github.workspace }}/work/ci-runtime
+      PYTHONPATH: ${{ github.workspace }}/vendor/trae2api-cn
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: node scripts/prepare-ci.mjs
+      - run: npm test
+      - name: Upstream protocol tests
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            work/ci-runtime/venv/Scripts/python.exe -m unittest discover -s tests/engine
+          else
+            work/ci-runtime/venv/bin/python -m unittest discover -s tests/engine
+          fi
+      - run: npm run check
+      - run: npm pack --ignore-scripts
+      - run: npm install --prefix work/test-host @deepseek-ai/dsh@0.2.0-rc.2 --ignore-scripts
+      - run: node scripts/host-smoke.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.os }}
+          path: "*.tgz"

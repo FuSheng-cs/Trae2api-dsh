@@ -1,0 +1,10618 @@
+"""
+main.py - Trae CN Relay 中转站
+提供 OpenAI 兼容的 REST API:  GET  /v1/models
+  POST /v1/chat/completions
+  POST /v1/responses
+  POST /v1/chat
+  POST /v1
+
+上游模式:  UPSTREAM_MODE=cli  - 只使用本地 Trae CLI 子进程
+  UPSTREAM_MODE=auto - 与 raw 相同，所有模型请求直达 Trae 原生 chat 协议
+  UPSTREAM_MODE=raw  - 直连 Trae 原生 chat 协议（direct 为别名）
+  UPSTREAM_MODE=remote/9router - 只用 9router 风格 remote 会话
+  UPSTREAM_MODE=web  - 只用旧版 CN remote 会话（兼容保留）
+  UPSTREAM_MODE=ide  - 只用 IDE Agent /api/agent/v3/llm_utils_chat
+  UPSTREAM_MODE=solo - 只用 Trae SOLO /api/agent/v3/llm_utils_chat
+  UPSTREAM_MODE=traework-native - Windows helper 承载 TraeWork ai-agent.dll
+"""
+
+import asyncio
+import base64
+import binascii
+import codecs
+import gzip
+import hashlib
+import html as html_mod
+import ipaddress
+import json
+import logging
+import os
+import re
+import threading
+import time
+import secrets
+import sys
+import uuid as uuid_mod
+import zlib
+from collections import OrderedDict
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Mapping, Optional
+
+import dotenv
+
+# Several transport modules cache environment-derived defaults at import time.
+# Load the project .env before importing them so local and Docker startup use
+# the same configuration order.
+dotenv.load_dotenv()
+
+import anyio
+import httpx
+from fastapi import FastAPI, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse
+
+from . import (
+    auth,
+    cli_client,
+    raw_client,
+    responses_api,
+    trae_client,
+    trae_remote_client,
+    traework_compat,
+    traework_native_bridge,
+)
+from .model_limits import clamp_max_completion_tokens
+from .sse import (
+    EmptyUpstreamResponse,
+    ModelProviderMismatch,
+    RepeatedCompletedToolResponse,
+    collect_nonstream_cli,
+    collect_nonstream_ide,
+    collect_nonstream_web,
+    translate_cli_stream,
+    translate_ide_stream,
+    translate_web_events,
+)
+
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper())
+logger = logging.getLogger("trae-cn-relay")
+
+HOST = os.environ.get("HOST", "0.0.0.0")
+PORT = int(os.environ.get("PORT", "8000"))
+API_KEYS = [k.strip() for k in os.environ.get("RELAY_API_KEYS", "").split(",") if k.strip()]
+UPSTREAM_MODE = (os.environ.get("UPSTREAM_MODE", "remote") or "remote").lower()
+_VALID_UPSTREAM_MODES = (
+    "remote", "raw", "direct", "auto", "web", "ide", "solo", "work-agent",
+    "9router", "trae-remote", "cli", "traework-native",
+    "native", "traework",
+)
+
+
+def _current_upstream_mode() -> str:
+    """Read the upstream mode at request time so preset changes apply immediately."""
+    # The module attribute is authoritative.  The startup read already merged
+    # env defaults, and runtime preset changes update both env and the module
+    # value.  Tests can patch ``src.main.UPSTREAM_MODE`` to isolate scenarios.
+    return str(globals().get("UPSTREAM_MODE") or "remote").lower()
+
+
+def _restore_persisted_relay_settings() -> dict:
+    """Apply console settings that live in the account store after startup.
+
+    The container environment is a useful bootstrap/default, but the web
+    console also persists relay settings in ``data/accounts.json``.  Restore
+    those values after ``auth.init_auth()`` so a container recreation does not
+    silently switch the selected upstream back to the image's ``.env``.
+    """
+
+    global UPSTREAM_MODE, WEB_BASE
+    settings = auth.get_settings() or {}
+    # The IDE Raw/IDE Agent and Remote/Work Agent presets intentionally share
+    # base URLs.  ``endpoint_id`` is therefore the authoritative persisted
+    # identity when present; URL-only restoration is retained for stores
+    # written by older releases.
+    endpoint_id = str(settings.get("endpoint_id") or "").strip().lower()
+    endpoint = next(
+        (
+            item
+            for item in UPSTREAM_ENDPOINT_PRESETS
+            if str(item.get("id") or "").strip().lower() == endpoint_id
+        ),
+        None,
+    ) if endpoint_id else None
+    mode = str(
+        (endpoint or {}).get("mode")
+        or settings.get("upstream_mode")
+        or ""
+    ).strip().lower()
+    if mode in _VALID_UPSTREAM_MODES:
+        UPSTREAM_MODE = mode
+        os.environ["UPSTREAM_MODE"] = mode
+    web_base = str(
+        (endpoint or {}).get("base_url")
+        or settings.get("web_base_url")
+        or ""
+    ).strip().rstrip("/")
+    if web_base:
+        WEB_BASE = web_base
+        os.environ["TRAE_WEB_BASE_URL"] = web_base
+    # Repair partially migrated stores once at startup.  This also makes the
+    # settings API/UI observe the same canonical mode and URL as dispatch.
+    if endpoint is not None and (
+        settings.get("upstream_mode") != endpoint["mode"]
+        or str(settings.get("web_base_url") or "").strip().rstrip("/")
+        != str(endpoint["base_url"]).rstrip("/")
+    ):
+        try:
+            auth.set_relay_settings(
+                web_base_url=str(endpoint["base_url"]),
+                upstream_mode=str(endpoint["mode"]),
+                endpoint_id=str(endpoint["id"]),
+            )
+            # ``auth.set_relay_settings`` persists the canonical values, but
+            # an older/custom store adapter may return a stale snapshot from
+            # ``get_settings`` immediately afterwards.  Return the same
+            # canonical state that was applied to the running process so the
+            # settings page cannot rehydrate the shared URL as Raw/Remote.
+            settings = dict(settings)
+            settings.update(
+                {
+                    "web_base_url": str(endpoint["base_url"]).rstrip("/"),
+                    "upstream_mode": str(endpoint["mode"]).strip().lower(),
+                    "endpoint_id": str(endpoint["id"]).strip().lower(),
+                }
+            )
+        except Exception:
+            logger.debug("could not repair persisted endpoint preset", exc_info=True)
+    return settings
+
+FORWARD_USAGE = (os.environ.get("FORWARD_USAGE", "true") or "true").lower() == "true"
+CHECKIN_INTERVAL = float(os.environ.get("TRAE_CHECKIN_INTERVAL_SECONDS", "60") or "60")
+CHECKIN_RETRY_AFTER = float(
+    os.environ.get("TRAE_CHECKIN_9074_RETRY_SECONDS", "60") or "60"
+)
+CHECKIN_9074_MAX_BACKOFF = float(
+    os.environ.get("TRAE_CHECKIN_9074_MAX_BACKOFF_SECONDS", "3600") or "3600"
+)
+# Cap the doubling so a long 9074 streak settles at minutes, not the ceiling.
+CHECKIN_9074_BACKOFF_EXPONENT_CAP = max(
+    0,
+    int(os.environ.get("TRAE_CHECKIN_9074_BACKOFF_EXPONENT_CAP", "3") or "3"),
+)
+CHECKIN_AUTO_RETRY_INTERVAL = float(
+    os.environ.get("TRAE_CHECKIN_AUTO_RETRY_INTERVAL_SECONDS", "60") or "60"
+)
+WEB_BASE = (os.environ.get("TRAE_WEB_BASE_URL", "https://trae-api-cn.mchost.guru/api/remote/v1")).rstrip("/")
+UPSTREAM_ENDPOINT_PRESETS = (
+    {
+        "id": "remote",
+        "label": "Remote / chat_sessions",
+        "base_url": "https://trae-api-cn.mchost.guru/api/remote/v1",
+        "mode": "remote",
+    },
+    {
+        "id": "ide",
+        "label": "IDE Agent / llm_utils_chat",
+        "base_url": "https://trae-api-cn.mchost.guru",
+        "mode": "ide",
+    },
+    {
+        "id": "solo",
+        "label": "Solo / api/agent/v3/llm_utils_chat",
+        "base_url": "https://trae-api-cn.mchost.guru",
+        "endpoint_url": "https://trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat",
+        "endpoint_path": "/api/agent/v3/llm_utils_chat",
+        # The Solo transport is implemented by the existing IDE client.  The
+        # distinct mode keeps the selected protocol visible and persistent
+        # while reusing its headers, SSE parser and fallback behavior.
+        "mode": "solo",
+    },
+    {
+        "id": "agent",
+        "label": "Work Agent / solo_work_remote",
+        "base_url": "https://trae-api-cn.mchost.guru/api/remote/v1",
+        "mode": "work-agent",
+    },
+)
+CHAT_OPTION_FIELDS = (
+    "tools",
+    "tool_choice",
+    "parallel_tool_calls",
+    "client_context",
+    "clientContext",
+    "session_id",
+    "sessionId",
+    "max_tokens",
+    "maxTokens",
+    "max_completion_tokens",
+    "temperature",
+    "top_p",
+    "stop",
+    "presence_penalty",
+    "frequency_penalty",
+    "seed",
+    # ``thinking`` is a client-visible presentation/request hint.  It must be
+    # retained through the relay even though the native raw body has no field
+    # for it; the SSE/Responses translators use it to expose a compact
+    # reasoning summary without leaking the full upstream trace.
+    "thinking",
+    "reasoning_effort",
+    # Per-request 1M max opt-in; the console switch is the global default.
+    "trae_max_mode",
+    "max_mode",
+    "stream_options",
+    "response_format",
+    "service_tier",
+    "user",
+    "logprobs",
+    "top_logprobs",
+    # TraeWork model-selection aliases passed through to the raw transport.
+    # Raw session ids are intentionally not caller-overridable: the relay pins
+    # one upstream conversation to each account/model pair.
+    "traeRawConfigName",
+    "traeRawModelName",
+    "rawModelName",
+    "configName",
+    "displayName",
+    "modelName",
+    "provider",
+    "configSource",
+    # TraeWork native Ode/Gpt payload aliases. These are ignored by raw/remote
+    # transports and are consumed only by the opt-in Windows helper route.
+    "native_data",
+    "native_user_info",
+    "native_common_params",
+    "native_streamlined_common_params",
+    "native_client_info",
+    "connect_session_id",
+    "connectSessionId",
+    "native_session_id",
+    "native_channel_id",
+    "channel_id",
+    "workspace_folder",
+    "workspacePath",
+    "workspace_id",
+    "workspaceId",
+    "device_id",
+    "deviceId",
+    "agent_type",
+    "shell_execute_strategy",
+    "model_auto_selection",
+    "custom_model",
+    "model_config_source",
+    "modelConfigSource",
+    "model_is_preset",
+    "modelIsPreset",
+    "model_provider",
+    "modelProvider",
+    "ppe_env_name",
+    "ppeEnvName",
+    "envLane",
+    "agentEnv",
+    "forceSandboxType",
+    "version_code",
+    "versionCode",
+)
+
+# Per-request usage tracking. Records are stored separately from account data so
+# a dashboard/deploy change can never rewrite the saved login cache.
+_USAGE_HISTORY: list[dict] = []
+
+
+def _usage_history_limit() -> int:
+    """Return the persisted request-history cap.
+
+    The daily usage buckets are the long-lived source of truth for totals, but
+    the detail endpoint should not discard almost every request in a busy
+    relay.  Keep the default large enough for normal deployments while
+    allowing operators to tune disk usage explicitly.
+    """
+
+    raw = os.environ.get("TRAE_USAGE_MAX_HISTORY", "1000")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = 1000
+    return max(100, min(value, 100_000))
+
+
+_USAGE_MAX_HISTORY = _usage_history_limit()
+_USAGE_LOCK = threading.RLock()
+_USAGE_RECORDS_PATH = Path(
+    os.environ.get("TRAE_USAGE_RECORDS_PATH", "")
+    or (Path(__file__).resolve().parent.parent / "data" / "usage_records.json")
+)
+# Lifetime token totals bucketed by Asia/Shanghai day. The request history
+# above is capped, so the dashboard overview reads this file instead.
+_USAGE_STATS_PATH_OVERRIDE = os.environ.get("TRAE_USAGE_STATS_PATH", "")
+_USAGE_STATS: dict[str, Any] = {"days": {}}
+_USAGE_STATS_FIELDS = (
+    "requests",
+    "completed",
+    "failed",
+    "input_tokens",
+    "output_tokens",
+    "cached_tokens",
+    "total_tokens",
+    "credits",
+    # Request capability metadata is aggregated separately from token
+    # accounting so the dashboard can answer "how many requests used Max or
+    # tools?" without scanning the capped request history.
+    "max_mode_requests",
+    "max_mode_enabled_requests",
+    "tool_requests",
+    "tool_calls",
+)
+_USAGE_STATS_MAX_DAYS = 400
+_PROCESS_STARTED_AT = time.time()
+
+# Project logo: a "T" whose crossbar runs into a relay arrow, black tile with a
+# green rim to match the console theme. docs/logo.svg mirrors this markup.
+_LOGO_PATHS = (
+    '<rect x="3" y="3" width="58" height="58" rx="14" fill="#0b100d" '
+    'stroke="#22c55e" stroke-width="4"/>'
+    '<g fill="none" stroke="#22c55e" stroke-width="6" stroke-linecap="round" '
+    'stroke-linejoin="round"><path d="M17 22h27"/><path d="M39 14l9 8-9 8"/>'
+    '<path d="M28 22v24"/></g>'
+    '<circle cx="28" cy="47" r="4.5" fill="#4ade80"/>'
+)
+LOGO_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" '
+    'aria-label="Trae2api-cn"><title>Trae2api-cn</title>' + _LOGO_PATHS + "</svg>"
+)
+_LOGO_SVG_INLINE = (
+    '<svg viewBox="0 0 64 64" aria-hidden="true" focusable="false">'
+    + _LOGO_PATHS
+    + "</svg>"
+)
+_FAVICON_LINKS = (
+    '<link rel="icon" type="image/svg+xml" href="/favicon.svg">'
+    '<link rel="apple-touch-icon" href="/favicon.svg">'
+)
+_USAGE_TRACKER: ContextVar[Any] = ContextVar("trae_usage_tracker", default=None)
+_USAGE_ENRICH_TASKS: set[asyncio.Task] = set()
+_USAGE_SNAPSHOT_TASKS: set[asyncio.Task] = set()
+_USAGE_PENDING_TASK_IDS: set[str] = set()
+_USAGE_ACTIVE_ACCOUNTS: dict[str, int] = {}
+_USAGE_UNSAFE_ACCOUNTS: set[str] = set()
+_CHECKIN_ACCOUNT_LOCKS: dict[str, asyncio.Lock] = {}
+_CHECKIN_CLAIM_GATE: asyncio.Lock | None = None
+_CHECKIN_CLAIM_GATE_LOOP: asyncio.AbstractEventLoop | None = None
+_CHECKIN_NEXT_CLAIM_AT = 0.0
+_CHECKIN_COOLDOWN_UNTIL: dict[str, float] = {}
+# The claim endpoint and the status endpoint are throttled independently: 9074
+# ("too many users, retry later") on claim does not stop status from answering
+# code=0. Track the status-side window separately so a claim cooldown cannot
+# freeze the dashboard on a stale checked_in value.
+_CHECKIN_STATUS_COOLDOWN_UNTIL: dict[str, float] = {}
+_CHECKIN_ACCEPTED_UNTIL: dict[str, float] = {}
+_CHECKIN_TIMEZONE = timezone(timedelta(hours=8), name="Asia/Shanghai")
+# Kept as a compatibility knob for older integrations; claim no longer runs
+# automatic verification probes.
+_CHECKIN_VERIFY_DELAYS: tuple[float, ...] = ()
+
+# OpenAI clients normally replay the complete conversation instead of sending
+# a relay-specific session id. Tool execution can legitimately take several
+# minutes, so keep the credential/session binding long enough for those
+# continuations to return to the same upstream account.
+_CHAT_SESSION_TTL = max(
+    1.0,
+    float(
+        os.environ.get(
+            "TRAE_SESSION_IDLE_TIMEOUT_SECONDS",
+            os.environ.get("TRAE_CHAT_SESSION_TTL_SECONDS", "3600"),
+        )
+        or "3600"
+    ),
+)
+_CHAT_SESSION_MAX = max(64, int(os.environ.get("TRAE_CHAT_SESSION_CACHE_SIZE", "2048") or "2048"))
+_CHAT_SESSION_LOCK = threading.RLock()
+_CHAT_HISTORY_SESSIONS: OrderedDict[str, tuple[str, float]] = OrderedDict()
+
+
+@dataclass
+class _UpstreamSessionLease:
+    account_id: str
+    billing_id: str
+    auth_token: str
+    last_client_activity: float
+    active_streams: int = 0
+    provider_specific: dict[str, Any] = field(default_factory=dict)
+
+
+_UPSTREAM_SESSION_LEASES: OrderedDict[str, _UpstreamSessionLease] = OrderedDict()
+
+
+class _ModelAccountUnavailable(RuntimeError):
+    """No enabled credential can receive this model request."""
+
+
+def _ensure_model_account_enabled(account_id: str = "", token: str = "") -> None:
+    identities = {str(account_id or ""), _account_id_from_token(token)} - {""}
+    for identity in identities:
+        if not auth.is_account_model_enabled(identity):
+            raise _ModelAccountUnavailable(
+                "The bound model account is disabled; enable it in 账号与签到 "
+                "or start a new session with an enabled account"
+            )
+    if not identities:
+        accounts = auth.get_accounts_raw()
+        if accounts and all(not auth._record_model_enabled(rec) for _, rec in accounts):
+            raise _ModelAccountUnavailable(
+                "No enabled model account available; enable an account in 账号与签到"
+            )
+
+
+def _credit_settle_seconds() -> float:
+    try:
+        value = float(os.environ.get("TRAE_USAGE_CREDIT_SETTLE_SECONDS", "1"))
+    except (TypeError, ValueError):
+        value = 1.0
+    return max(0.0, min(value, 10.0))
+
+
+def _session_usage_enabled() -> bool:
+    return str(os.environ.get("TRAE_USAGE_SESSION_QUERY", "true")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _session_usage_query_attempts() -> int:
+    try:
+        value = int(os.environ.get("TRAE_USAGE_QUERY_RETRIES", "5") or "5")
+    except (TypeError, ValueError):
+        value = 5
+    return max(1, min(value, 8))
+
+
+def _session_usage_query_delay() -> float:
+    try:
+        value = float(
+            os.environ.get("TRAE_USAGE_QUERY_RETRY_DELAY_SECONDS", "0.5")
+            or "0.5"
+        )
+    except (TypeError, ValueError):
+        value = 0.5
+    return max(0.0, min(value, 10.0))
+
+
+# Web login auth
+TRAE_AUTH_URL = os.environ.get("TRAE_AUTH_URL", "https://www.trae.cn/authorization")
+TRAE_CLIENT_ID = os.environ.get("TRAE_CLIENT_ID") or "ono9krqynydwx5"
+LOCAL_LISTENER_PORT = int(os.environ.get("WEB_LOGIN_LISTENER_PORT", "8765"))
+PUBLIC_PATHS = {
+    "/healthz",
+    "/favicon.svg",
+    "/favicon.ico",
+    "/v1/status",
+    "/v1/models",
+    "/models",
+    "/web/login",
+    "/web/login/download",
+    "/authorize",
+    "/api/web-auth",
+    "/api/logout",
+    "/api/accounts",
+    "/api/accounts/switch",
+    "/api/accounts/remove",
+    "/api/settings",
+    "/api/polling",
+    "/api/polling-mode",
+    "/api/max-mode",
+    "/api/max-mode/models",
+    "/api/auto-route",
+    "/api/auto-checkin",
+    "/api/auto-checkin/run",
+    "/api/checkin/status",
+    "/api/checkin/claim",
+    "/api/checkin/accounts",
+    "/api/checkin/claim-all",
+    "/api/checkin/claim-credits",
+    "/api/checkin/account",
+    "/api/checkin/work-credits",
+    "/api/usage/last",
+    "/api/usage/records",
+    "/api/overview",
+    # TraeWork custom-model management probes cannot reliably attach the
+    # relay API key before the model has been saved. Chat ingress remains
+    # protected by the normal middleware; only connectivity is public.
+    "/api/agent/v3/custom_model_connectivity_check",
+    "/api/ide/v1/custom_model_connectivity_check",
+    "/v1/custom_model/connectivity",
+}
+PUBLIC_PATH_PREFIXES = ("/api/checkin", "/api/accounts")
+WEB_LOGIN_SCRIPT = Path(__file__).resolve().parent.parent / "web_login.py"
+
+
+class _RequestBodyError(ValueError):
+    """A client request body could not be decoded as an OpenAI JSON object."""
+
+    def __init__(self, message: str, *, raw_bytes: int = 0):
+        super().__init__(message)
+        self.raw_bytes = max(0, int(raw_bytes))
+
+
+def _request_body_charset(content_type: str) -> str:
+    """Return a safe charset from Content-Type, defaulting to UTF-8."""
+
+    match = re.search(r"(?:^|;)\s*charset\s*=\s*['\"]?([^;\"']+)", content_type, re.I)
+    candidate = (match.group(1).strip() if match else "utf-8")
+    try:
+        return codecs.lookup(candidate).name
+    except LookupError:
+        return "utf-8"
+
+
+def _decode_request_content(raw: bytes, content_encoding: str) -> bytes:
+    """Decode common HTTP content codings before JSON parsing.
+
+    httpx/zcode may gzip the request body while the relay is served directly
+    by uvicorn. Starlette intentionally leaves Content-Encoding untouched, so
+    ``Request.json()`` would reject an otherwise valid payload. Decode only
+    codings available in the standard library; unknown codings are reported to
+    the caller instead of silently forwarding an empty prompt.
+    """
+
+    codings = [
+        item.strip().lower()
+        for item in (content_encoding or "").split(",")
+        if item.strip() and item.strip().lower() != "identity"
+    ]
+    decoded = raw
+    for coding in reversed(codings):
+        if coding in ("gzip", "x-gzip"):
+            try:
+                decoded = gzip.decompress(decoded)
+            except (OSError, EOFError) as exc:
+                raise _RequestBodyError(
+                    "Invalid gzip request body", raw_bytes=len(raw)
+                ) from exc
+        elif coding == "deflate":
+            try:
+                decoded = zlib.decompress(decoded)
+            except zlib.error:
+                try:
+                    # A few clients send a raw DEFLATE stream without zlib
+                    # framing. Accept it when the standard form fails.
+                    decoded = zlib.decompress(decoded, -zlib.MAX_WBITS)
+                except zlib.error as exc:
+                    raise _RequestBodyError(
+                        "Invalid deflate request body", raw_bytes=len(raw)
+                    ) from exc
+        else:
+            raise _RequestBodyError(
+                f"Unsupported request Content-Encoding: {coding}",
+                raw_bytes=len(raw),
+            )
+    return decoded
+
+
+async def _read_json_body(
+    request: Request,
+    *,
+    endpoint: str = "",
+    trace_id: str = "",
+) -> tuple[dict[str, Any], int]:
+    """Read and normalize one incoming JSON body without losing client data.
+
+    The raw byte count is returned for diagnostics. We deliberately do not log
+    body contents or token-bearing fields. A small compatibility allowance for
+    double-encoded JSON helps clients that pass a serialized request through a
+    generic transport wrapper.
+    """
+
+    try:
+        raw = await request.body()
+    except Exception as exc:
+        # A client that disconnects while still uploading must never look like
+        # an accepted empty task. Report it as a request-body failure, before
+        # any upstream route is selected.
+        raise _RequestBodyError(
+            "Request body could not be read before the upload completed"
+        ) from exc
+    raw_size = len(raw)
+    content_encoding = request.headers.get("content-encoding", "")
+    decoded = _decode_request_content(raw, content_encoding)
+    if not decoded.strip():
+        raise _RequestBodyError("Request body is empty", raw_bytes=raw_size)
+    charset = _request_body_charset(request.headers.get("content-type", ""))
+    try:
+        text = decoded.decode(charset).lstrip("\ufeff").strip()
+    except UnicodeDecodeError as exc:
+        raise _RequestBodyError(
+            f"Request body is not valid {charset} JSON", raw_bytes=raw_size
+        ) from exc
+    try:
+        payload: Any = json.loads(text)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise _RequestBodyError(
+            "Invalid JSON body", raw_bytes=raw_size
+        ) from exc
+    if isinstance(payload, str):
+        nested = payload.lstrip("\ufeff").strip()
+        if nested.startswith("{"):
+            try:
+                payload = json.loads(nested)
+            except json.JSONDecodeError as exc:
+                raise _RequestBodyError(
+                    "Invalid nested JSON body", raw_bytes=raw_size
+                ) from exc
+    if not isinstance(payload, Mapping):
+        raise _RequestBodyError(
+            "JSON body must be an object", raw_bytes=raw_size
+        )
+    body = dict(payload)
+    logger.info(
+        "request body received id=%s endpoint=%s bytes=%d decoded_bytes=%d content_type=%s "
+        "content_encoding=%s keys=%s",
+        trace_id or "-",
+        endpoint or request.url.path,
+        raw_size,
+        len(decoded),
+        request.headers.get("content-type", ""),
+        content_encoding or "identity",
+        ",".join(sorted(str(key) for key in body.keys())),
+    )
+    return body, raw_size
+
+
+def _message_content_fallback(message: Mapping[str, Any]) -> Any:
+    """Extract common non-OpenAI aliases used by zcode/OpenCode adapters."""
+
+    for key in ("parts", "text", "prompt", "message", "input"):
+        value = message.get(key)
+        if value not in (None, "", [], {}):
+            return value
+    return None
+
+
+def _normalize_chat_messages(value: Any) -> list[dict[str, Any]]:
+    """Coerce compatible chat message wrappers while preserving tool fields."""
+
+    if isinstance(value, str):
+        candidate = value.strip()
+        if candidate.startswith("["):
+            try:
+                value = json.loads(candidate)
+            except json.JSONDecodeError:
+                value = [value]
+        else:
+            value = [value]
+    if isinstance(value, Mapping):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for item in value:
+        if isinstance(item, str):
+            normalized.append({"role": "user", "content": item})
+            continue
+        if not isinstance(item, Mapping):
+            continue
+        message = dict(item)
+        role = str(message.get("role") or message.get("speaker") or "user")
+        if role not in ("system", "developer", "user", "assistant", "tool", "function"):
+            role = "user"
+        message["role"] = role
+        if (
+            message.get("content") in (None, "", [])
+            and not message.get("tool_calls")
+        ):
+            fallback = _message_content_fallback(message)
+            if fallback is not None:
+                message["content"] = fallback
+        normalized.append(message)
+    return cli_client.repair_tool_call_history(normalized)
+
+
+def _json_loads_safe(value: str) -> dict:
+    if not value:
+        return {}
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
+
+async def _parse_oauth_params(query: dict) -> dict:
+    """解析 Trae 授权回调参数。
+
+    Trae 网页授权页实际会走两套流程：
+      1. 新流程 (code_challenge): callback 会带 authCodeInfo / code 等参数
+      2. 老流程 (refreshToken): callback 直接带 refreshToken=xxx
+    对于老流程，本地不会拥有 Cloud-IDE-JWT，需要拿到 refreshToken 后通过
+    oauth/ExchangeToken 向 api.trae.cn 兑换 Cloud-IDE-JWT。
+    """
+    user_jwt = _json_loads_safe(query.get("userJwt", ""))
+    token = user_jwt.get("Token") or user_jwt.get("token") or ""
+    refresh = user_jwt.get("RefreshToken") or user_jwt.get("refreshToken") or query.get("refreshToken") or query.get("data") or ""
+    token_exp = user_jwt.get("TokenExpireAt") or user_jwt.get("tokenExpireAt") or ""
+    refresh_exp = user_jwt.get("RefreshExpireAt") or user_jwt.get("refreshExpireAt") or query.get("refreshExpireAt") or ""
+
+    user_info = _json_loads_safe(query.get("userInfo", ""))
+    user_id = user_info.get("UserID") or user_info.get("userId") or user_info.get("userID") or query.get("userId") or ""
+    region = user_info.get("Region") or user_info.get("region") or query.get("region") or "CN"
+    ai_region = user_info.get("AIRegion") or user_info.get("aiRegion") or region
+    client_id = user_jwt.get("ClientID") or user_jwt.get("clientId") or query.get("clientID") or query.get("clientId") or query.get("client_id") or ""
+    host = query.get("host") or user_info.get("Host") or user_info.get("host") or ""
+
+    if not token and refresh:
+        exchange = await _exchange_refresh_token(
+            refresh_token=refresh,
+            client_id=client_id or TRAE_CLIENT_ID,
+            host=host,
+        )
+        if exchange.get("token"):
+            token = exchange["token"]
+            refresh = exchange.get("refresh_token") or refresh
+            token_exp = exchange.get("expired_at") or token_exp
+            refresh_exp = exchange.get("refresh_expired_at") or refresh_exp
+            client_id = exchange.get("client_id") or client_id
+            host = exchange.get("host") or host
+            user_id = exchange.get("user_id") or user_id
+            user_info = exchange.get("user_info") or user_info
+            region = exchange.get("region") or region
+            ai_region = exchange.get("ai_region") or region
+
+    if not token:
+        return {}
+
+    uid = user_id or ""
+    return {
+        "token": token,
+        "refresh_token": refresh,
+        "user_id": uid,
+        "tenant_id": user_info.get("TenantID") or user_info.get("tenantId") or "",
+        "region": region,
+        "ai_region": ai_region,
+        "host": host,
+        "expired_at": str(token_exp) if token_exp else "",
+        "refresh_expired_at": str(refresh_exp) if refresh_exp else "",
+        "client_id": client_id,
+        "web_id": user_info.get("WebId") or user_info.get("webId") or uid,
+        "biz_user_id": user_info.get("BizUserId") or user_info.get("bizUserId") or uid,
+        "user_unique_id": user_info.get("UserUniqueId") or user_info.get("userUniqueId") or uid,
+        "scope": query.get("scope") or user_info.get("Scope") or user_info.get("scope") or "",
+        "tenant": user_info.get("Tenant") or user_info.get("tenant") or "",
+        "app_language": user_info.get("AppLanguage") or user_info.get("appLanguage") or "",
+        "user_region": query.get("userRegion") or user_info.get("UserRegion") or user_info.get("userRegion") or "",
+        "user_identity": user_info.get("UserIdentity") or user_info.get("userIdentity") or "",
+        "screen_name": user_info.get("ScreenName") or user_info.get("screenName") or "",
+    }
+
+async def _exchange_refresh_token(refresh_token: str, client_id: str, host: str = "") -> dict:
+    """使用 refreshToken 向 Trae CN 兑换 Cloud-IDE-JWT。
+
+    与 Trae 官网实现一致:
+      POST https://api.trae.cn/cloudide/api/v3/trae/oauth/ExchangeToken
+      {"ClientID":..., "RefreshToken":..., "ClientSecret":"-", "UserID":""}
+    """
+    if not refresh_token:
+        return {}
+    base = host or "https://api.trae.cn"
+    base = base.rstrip("/")
+    url = base + "/cloudide/api/v3/trae/oauth/ExchangeToken"
+    payload = {
+        "ClientID": client_id,
+        "RefreshToken": refresh_token,
+        "ClientSecret": "-",
+        "UserID": "",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.post(url, json=payload)
+            body = resp.text
+            status = resp.status_code
+    except Exception as e:
+        logger.warning("ExchangeToken failed: %s", e)
+        return {}
+
+    if status != 200:
+        logger.warning("ExchangeToken HTTP %s: %s", status, body[:500])
+        return {}
+
+    result = _json_loads_safe(body)
+    data = result.get("Result") or result.get("result") or result
+    if not isinstance(data, dict):
+        logger.warning("ExchangeToken unexpected result: %s", body[:500])
+        return {}
+
+    token = data.get("Token") or data.get("token") or data.get("AccessToken") or data.get("accessToken") or ""
+    if not token:
+        logger.warning("ExchangeToken missing Token: %s", body[:500])
+        return {}
+
+    refresh2 = data.get("RefreshToken") or data.get("refreshToken") or refresh_token
+    user_info = _json_loads_safe(str(data.get("UserInfo") or data.get("userInfo") or ""))
+    return {
+        "token": token,
+        "refresh_token": refresh2,
+        "expired_at": str(data.get("TokenExpireAt") or data.get("tokenExpireAt") or ""),
+        "refresh_expired_at": str(data.get("RefreshExpireAt") or data.get("refreshExpireAt") or ""),
+        "client_id": data.get("ClientID") or data.get("clientId") or client_id,
+        "host": host or base,
+        "user_id": user_info.get("UserID") or user_info.get("userId") or data.get("UserID") or data.get("userId") or "",
+        "user_info": user_info,
+        "region": user_info.get("Region") or user_info.get("region") or data.get("Region") or data.get("region") or "CN",
+        "ai_region": user_info.get("AIRegion") or user_info.get("aiRegion") or data.get("AIRegion") or data.get("aiRegion") or "",
+    }
+
+
+def _apply_parsed_creds(p: dict) -> None:
+    """将解析后的凭证写入 auth 状态。"""
+    auth.apply_oauth_callback(
+        token=p.get("token", ""),
+        refresh_token=p.get("refresh_token", ""),
+        user_id=p.get("user_id", ""),
+        tenant_id=p.get("tenant_id", ""),
+        region=p.get("region", ""),
+        ai_region=p.get("ai_region", ""),
+        host=p.get("host", ""),
+        expired_at=p.get("expired_at", ""),
+        refresh_expired_at=p.get("refresh_expired_at", ""),
+        client_id=p.get("client_id", ""),
+        web_id=p.get("web_id", ""),
+        biz_user_id=p.get("biz_user_id", ""),
+        user_unique_id=p.get("user_unique_id", ""),
+        scope=p.get("scope", ""),
+        tenant=p.get("tenant", ""),
+        app_language=p.get("app_language", ""),
+        user_region=p.get("user_region", ""),
+        user_identity=p.get("user_identity", ""),
+        screen_name=p.get("screen_name", ""),
+    )
+
+
+APP_VERSION = "1.0.4"
+
+# Inline Lucide icons (ISC license) so the intranet console has no CDN dependency.
+_LUCIDE_ICONS = {
+    'zap': '<path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/>',
+    'users': '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>',
+    'receipt': '<path d="M4 2v20l2-1 2 1 2-1 2 1 2-1 2 1 2-1 2 1V2l-2 1-2-1-2 1-2-1-2 1-2-1-2 1Z"/><path d="M16 8h-6a2 2 0 1 0 0 4h4a2 2 0 1 1 0 4H8"/><path d="M12 17.5v-11"/>',
+    'sliders-horizontal': '<line x1="21" x2="14" y1="4" y2="4"/><line x1="10" x2="3" y1="4" y2="4"/><line x1="21" x2="12" y1="12" y2="12"/><line x1="8" x2="3" y1="12" y2="12"/><line x1="21" x2="16" y1="20" y2="20"/><line x1="12" x2="3" y1="20" y2="20"/><line x1="14" x2="14" y1="2" y2="6"/><line x1="8" x2="8" y1="10" y2="14"/><line x1="16" x2="16" y1="18" y2="22"/>',
+    'activity': '<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>',
+    'calendar-check': '<path d="M8 2v4"/><path d="M16 2v4"/><rect width="18" height="18" x="3" y="4" rx="2"/><path d="M3 10h18"/><path d="m9 16 2 2 4-4"/>',
+    'arrow-left-right': '<path d="M8 3 4 7l4 4"/><path d="M4 7h16"/><path d="m16 21 4-4-4-4"/><path d="M20 17H4"/>',
+    'trash-2': '<path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/>',
+    'log-out': '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" x2="9" y1="12" y2="12"/>',
+    'log-in': '<path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" x2="3" y1="12" y2="12"/>',
+    'refresh-cw': '<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/>',
+    'coins': '<circle cx="8" cy="8" r="6"/><path d="M18.09 10.37A6 6 0 1 1 10.34 18"/><path d="M7 6h1v4"/><path d="m16.71 13.88.7.71-2.82 2.82"/>',
+    'check-check': '<path d="M18 6 7 17l-5-5"/><path d="m22 10-7.5 7.5L13 16"/>',
+    'shield-check': '<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/>',
+    'download': '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/>',
+    'external-link': '<path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>',
+    'play': '<polygon points="6 3 20 12 6 21 6 3"/>',
+    'save': '<path d="M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><path d="M17 21v-7a1 1 0 0 0-1-1H8a1 1 0 0 0-1 1v7"/><path d="M7 3v4a1 1 0 0 0 1 1h7"/>',
+    'search': '<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>',
+    'list': '<line x1="8" x2="21" y1="6" y2="6"/><line x1="8" x2="21" y1="12" y2="12"/><line x1="8" x2="21" y1="18" y2="18"/><line x1="3" x2="3.01" y1="6" y2="6"/><line x1="3" x2="3.01" y1="12" y2="12"/><line x1="3" x2="3.01" y1="18" y2="18"/>',
+    'sun': '<circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/>',
+    'moon': '<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/>',
+    'list-plus': '<path d="M11 12H3"/><path d="M16 6H3"/><path d="M16 18H3"/><path d="M18 9v6"/><path d="M21 12h-6"/>',
+    'layout-dashboard': '<rect width="7" height="9" x="3" y="3" rx="1"/><rect width="7" height="5" x="14" y="3" rx="1"/><rect width="7" height="9" x="14" y="12" rx="1"/><rect width="7" height="5" x="3" y="16" rx="1"/>',
+    'database': '<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5V19A9 3 0 0 0 21 19V5"/><path d="M3 12A9 3 0 0 0 21 12"/>',
+    'arrow-down-to-line': '<path d="M12 17V3"/><path d="m6 11 6 6 6-6"/><path d="M19 21H5"/>',
+    'arrow-up-from-line': '<path d="m18 9-6-6-6 6"/><path d="M12 3v14"/><path d="M5 21h14"/>',
+    'sigma': '<path d="M18 7V5a1 1 0 0 0-1-1H6.5a.5.5 0 0 0-.4.8l4.5 6a2 2 0 0 1 0 2.4l-4.5 6a.5.5 0 0 0 .4.8H17a1 1 0 0 0 1-1v-2"/>',
+    'calendar': '<path d="M8 2v4"/><path d="M16 2v4"/><rect width="18" height="18" x="3" y="4" rx="2"/><path d="M3 10h18"/>',
+    'server': '<rect width="20" height="8" x="2" y="2" rx="2" ry="2"/><rect width="20" height="8" x="2" y="14" rx="2" ry="2"/><line x1="6" x2="6.01" y1="6" y2="6"/><line x1="6" x2="6.01" y1="18" y2="18"/>',
+}
+
+
+def _icon(name: str) -> str:
+    return (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" '
+        'stroke="currentColor" stroke-width="2" stroke-linecap="round" '
+        f'stroke-linejoin="round" aria-hidden="true">{_LUCIDE_ICONS[name]}</svg>'
+    )
+
+_CONSOLE_CSS = """
+:root, [data-theme="light"] {
+  color-scheme: light;
+  --bg: #f2f4f2;
+  --surface: #ffffff;
+  --surface-2: #f6f8f6;
+  --frame: #1a201d;
+  --line: #dde3df;
+  --line-strong: #bcc6c0;
+  --text: #111613;
+  --muted: #4f5b55;
+  --faint: #7d8983;
+  --accent: #15803d;
+  --accent-hover: #116a32;
+  --accent-soft: #e7f5ec;
+  --accent-line: #9fd5b2;
+  --on-accent: #ffffff;
+  --edge: #16a34a;
+  --ring: rgba(22,163,74,.22);
+  --row-hover: #f7faf8;
+  --row-active: #eef8f1;
+  --topbar: rgba(242,244,242,.92);
+  --shadow: 0 10px 28px rgba(10,20,14,.14);
+  --side-bg: #0e1311;
+  --side-line: #1f2a24;
+  --side-text: #e4ece7;
+  --side-muted: #8fa198;
+  --side-hover: #18211c;
+  --side-active: #13301f;
+  --side-accent: #4ade80;
+  --ok: #15803d;
+  --ok-soft: #e7f5ec;
+  --ok-line: #9fd5b2;
+  --warn: #a35200;
+  --warn-soft: #fdf1e1;
+  --warn-line: #efcf9f;
+  --danger: #c0262d;
+  --danger-soft: #fdebec;
+  --danger-line: #f0bcbf;
+  --knob: #ffffff;
+  --chart-in: #16a34a;
+  --chart-cache: #0b5e2e;
+  --chart-out: #2563eb;
+  --mono: "JetBrains Mono", "SF Mono", Consolas, "Courier New", monospace;
+  --radius: 8px;
+  --radius-sm: 6px;
+}
+[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #090c0b;
+  --surface: #101513;
+  --surface-2: #151c18;
+  --frame: #1f6b40;
+  --line: #222d27;
+  --line-strong: #33433a;
+  --text: #e3ece6;
+  --muted: #9aaca2;
+  --faint: #6c7d74;
+  --accent: #22c55e;
+  --accent-hover: #4ade80;
+  --accent-soft: #10251a;
+  --accent-line: #1f6b40;
+  --on-accent: #04130a;
+  --edge: #22c55e;
+  --ring: rgba(34,197,94,.28);
+  --row-hover: #131a16;
+  --row-active: #102419;
+  --topbar: rgba(9,12,11,.9);
+  --shadow: 0 12px 32px rgba(0,0,0,.55);
+  --side-bg: #060908;
+  --side-line: #1a2620;
+  --side-text: #e3ece6;
+  --side-muted: #7f938a;
+  --side-hover: #111a15;
+  --side-active: #0f2a1b;
+  --side-accent: #4ade80;
+  --ok: #4ade80;
+  --ok-soft: #0f2418;
+  --ok-line: #1f6b40;
+  --warn: #f5a524;
+  --warn-soft: #2a1d08;
+  --warn-line: #5c3f10;
+  --danger: #f87171;
+  --danger-soft: #2a1012;
+  --danger-line: #5e2428;
+  --knob: #e3ece6;
+  --chart-in: #22c55e;
+  --chart-cache: #137a3c;
+  --chart-out: #60a5fa;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+[hidden] { display:none !important; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", Roboto, sans-serif;
+  background: var(--bg); color: var(--text); min-height: 100vh;
+  font-size: 14px; line-height: 1.5; letter-spacing: 0;
+  transition: background .2s, color .2s;
+}
+code, .mono { font-family: var(--mono); font-size: 12px; }
+svg { width: 16px; height: 16px; flex-shrink: 0; }
+a { color: var(--accent); }
+:focus-visible { outline: 2px solid var(--edge); outline-offset: 2px; }
+::selection { background: var(--edge); color: var(--on-accent); }
+
+/* Shell: black sidebar with a green edge */
+.app { display: grid; grid-template-columns: 224px minmax(0, 1fr); min-height: 100vh; }
+.sidebar {
+  background: var(--side-bg); color: var(--side-text);
+  border-right: 2px solid var(--edge);
+  display: flex; flex-direction: column; position: sticky; top: 0; height: 100vh; overflow-y: auto;
+}
+.brand { display: flex; align-items: center; gap: 10px; padding: 16px 16px 14px; border-bottom: 1px solid var(--side-line); }
+.brand-mark {
+  width: 34px; height: 34px; flex-shrink: 0;
+  display: grid; place-items: center;
+}
+.brand-mark svg { width: 34px; height: 34px; display: block; }
+.brand-block { display: flex; flex-direction: column; min-width: 0; }
+.brand-block h1 { font-size: 15px; font-weight: 650; white-space: nowrap; color: var(--side-text); }
+.brand-sub { color: var(--side-muted); font-size: 11px; font-family: var(--mono); }
+.nav-list { display: flex; flex-direction: column; gap: 4px; padding: 12px 10px; }
+.nav-item {
+  display: flex; align-items: center; gap: 10px; width: 100%; height: 38px;
+  border: 1px solid transparent; background: transparent; color: var(--side-muted);
+  font: inherit; font-size: 13px; font-weight: 550; padding: 0 12px;
+  border-radius: var(--radius-sm); cursor: pointer; text-align: left; position: relative;
+  transition: background .12s, color .12s, border-color .12s;
+}
+.nav-item:hover { background: var(--side-hover); color: var(--side-text); }
+.nav-item.active { background: var(--side-active); color: var(--side-accent); border-color: rgba(74,222,128,.45); }
+.nav-item.active::before {
+  content: ""; position: absolute; left: -11px; top: 7px; bottom: 7px; width: 3px;
+  border-radius: 0 3px 3px 0; background: var(--side-accent);
+}
+.sidebar-foot { margin-top: auto; padding: 12px 16px 16px; border-top: 1px solid var(--side-line); font-size: 11px; color: var(--side-muted); display: flex; justify-content: space-between; gap: 8px; font-family: var(--mono); }
+
+.main { min-width: 0; display: flex; flex-direction: column; }
+.topbar {
+  position: sticky; top: 0; z-index: 5; background: var(--topbar);
+  backdrop-filter: blur(6px); border-bottom: 1px solid var(--frame);
+  display: flex; align-items: center; justify-content: space-between; gap: 12px 20px; flex-wrap: wrap;
+  padding: 12px 28px;
+}
+.topbar h2 { font-size: 17px; font-weight: 650; display: flex; align-items: center; gap: 10px; }
+.topbar h2::before { content: ""; width: 4px; height: 18px; border-radius: 2px; background: var(--edge); }
+.topbar-right { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.status-chips { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.chip {
+  display: inline-flex; align-items: center; gap: 6px; height: 26px; padding: 0 9px;
+  border: 1px solid var(--line-strong); background: var(--surface); border-radius: 999px;
+  font-size: 12px; color: var(--muted); white-space: nowrap; max-width: 260px;
+}
+.chip code { font-size: 11px; color: var(--text); overflow: hidden; text-overflow: ellipsis; }
+.chip-key { color: var(--faint); }
+.chip-user { color: var(--accent); border-color: var(--accent-line); background: var(--accent-soft); overflow: hidden; text-overflow: ellipsis; }
+
+/* Night mode switch */
+.theme-switch {
+  display: inline-flex; align-items: center; gap: 6px; height: 30px; padding: 0 9px;
+  border: 1px solid var(--frame); border-radius: 999px; background: var(--surface); cursor: pointer;
+}
+.theme-icon { display: inline-grid; place-items: center; color: var(--faint); transition: color .15s; }
+.theme-icon svg { width: 14px; height: 14px; }
+[data-theme="light"] .theme-sun { color: #c27c00; }
+[data-theme="dark"] .theme-moon { color: var(--accent); }
+
+.content { padding: 22px 28px 48px; width: 100%; max-width: 1240px; }
+
+/* Pages and framed sections */
+.tab-page { display: none; }
+.tab-page.active { display: block; animation: page-in .24s cubic-bezier(.22,1,.36,1); }
+@keyframes page-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+.panel-stack { display: flex; flex-direction: column; gap: 16px; }
+.panel-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
+.panel-grid.cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
+.panel-card {
+  background: var(--surface); border: 1px solid var(--frame); border-radius: var(--radius);
+  box-shadow: inset 0 3px 0 var(--edge);
+  padding: 18px 18px 16px; min-width: 0;
+}
+.span-2 { grid-column: 1 / -1; }
+.section-head { display: flex; align-items: center; justify-content: space-between; gap: 8px 12px; flex-wrap: wrap; margin-bottom: 12px; }
+.section-head > div { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; min-width: 0; }
+.section-title { font-size: 14px; font-weight: 650; color: var(--text); }
+.section-meta { color: var(--faint); font-size: 12px; }
+.section-desc { color: var(--muted); font-size: 12px; margin: -6px 0 12px; }
+.state-pill {
+  display: inline-flex; align-items: center; gap: 6px; height: 22px; padding: 0 9px; border-radius: 999px;
+  font-size: 12px; color: var(--muted); background: var(--surface-2); border: 1px solid var(--line-strong); white-space: nowrap;
+}
+.state-pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--line-strong); }
+.state-pill.on { color: var(--ok); background: var(--ok-soft); border-color: var(--ok-line); }
+.state-pill.on::before { background: var(--ok); box-shadow: 0 0 0 3px var(--ring); }
+
+/* Overview stats */
+.stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.stat {
+  background: var(--surface); border: 1px solid var(--frame); border-left: 4px solid var(--edge);
+  border-radius: var(--radius); padding: 12px 14px; display: flex; flex-direction: column; gap: 2px; min-width: 0;
+}
+.stat dt { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+.stat dt svg { width: 14px; height: 14px; color: var(--accent); }
+.stat dd { font-size: 22px; font-weight: 650; font-family: var(--mono); font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Buttons */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  height: 34px; padding: 0 14px; border-radius: var(--radius-sm);
+  font: inherit; font-size: 13px; font-weight: 600; white-space: nowrap;
+  cursor: pointer; border: 1px solid transparent; text-decoration: none;
+  transition: background .12s, border-color .12s, color .12s, box-shadow .12s, transform .12s;
+}
+.btn-sm { height: 30px; padding: 0 11px; font-size: 12px; }
+.btn-primary { background: var(--accent); border-color: var(--frame); color: var(--on-accent); }
+.btn-primary:hover { background: var(--accent-hover); box-shadow: 0 0 0 3px var(--ring); }
+.btn-secondary { background: var(--surface); border-color: var(--frame); color: var(--text); }
+.btn-secondary:hover { background: var(--accent-soft); color: var(--accent); }
+.btn-ghost { background: transparent; border-color: transparent; color: var(--muted); }
+.btn-ghost:hover { background: var(--surface-2); color: var(--text); }
+.btn-danger { background: transparent; border-color: var(--danger-line); color: var(--danger); }
+.btn-danger:hover { background: var(--danger-soft); }
+.btn:disabled, .icon-btn:disabled { opacity: .45; cursor: not-allowed; }
+.icon-btn {
+  width: 30px; height: 30px; display: inline-grid; place-items: center; flex-shrink: 0;
+  border-radius: var(--radius-sm); border: 1px solid var(--line-strong); background: var(--surface); color: var(--muted);
+  cursor: pointer; transition: background .12s, color .12s, border-color .12s, transform .12s;
+}
+.icon-btn:hover:not(:disabled) { color: var(--accent); border-color: var(--edge); background: var(--accent-soft); }
+.icon-btn.danger:hover:not(:disabled) { color: var(--danger); border-color: var(--danger-line); background: var(--danger-soft); }
+.btn-group { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 14px; }
+.toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.toolbar .spacer { flex: 1 1 auto; }
+.busy { opacity: .6; pointer-events: none; }
+
+/* Badges */
+.badge {
+  display: inline-flex; align-items: center; height: 22px; padding: 0 8px; border-radius: 999px;
+  font-size: 12px; font-weight: 550; white-space: nowrap; border: 1px solid transparent;
+}
+.badge-ok { background: var(--ok-soft); color: var(--ok); border-color: var(--ok-line); }
+.badge-expired { background: var(--warn-soft); color: var(--warn); border-color: var(--warn-line); }
+.badge-none { background: var(--surface-2); color: var(--muted); border-color: var(--line-strong); }
+.badge-active { background: var(--accent-soft); color: var(--accent); border-color: var(--accent-line); }
+
+/* Forms */
+.form-group { margin-bottom: 12px; min-width: 0; }
+.form-group:last-child { margin-bottom: 0; }
+.form-group > label, .field-label { display: block; font-size: 12px; font-weight: 550; color: var(--muted); margin-bottom: 5px; }
+.form-group input, .form-group textarea, .form-group select, .control {
+  width: 100%; height: 34px; padding: 0 10px; border-radius: var(--radius-sm); border: 1px solid var(--line-strong);
+  background: var(--surface-2); color: var(--text); font: inherit; font-size: 13px;
+}
+.form-group textarea { height: auto; min-height: 64px; padding: 8px 10px; resize: vertical; font-family: var(--mono); font-size: 12px; }
+.form-group input.mono-input { font-family: var(--mono); font-size: 12px; }
+.form-group input:focus, .form-group textarea:focus, .form-group select:focus, .control:focus {
+  outline: none; border-color: var(--edge); box-shadow: 0 0 0 3px var(--ring);
+}
+.form-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+.field-note { font-size: 12px; color: var(--faint); margin-top: 6px; }
+.required { color: var(--danger); }
+
+/* Switch */
+.switch-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 10px 0; }
+.switch-row + .switch-row { border-top: 1px solid var(--line); }
+.switch-text { min-width: 0; }
+.switch-text strong { display: block; font-size: 13px; font-weight: 600; }
+.switch-text span { display: block; font-size: 12px; color: var(--muted); }
+.switch { position: relative; display: inline-flex; width: 36px; height: 20px; flex-shrink: 0; cursor: pointer; }
+.switch input { position: absolute; inset: 0; opacity: 0; cursor: pointer; margin: 0; z-index: 1; }
+.switch .track { width: 100%; height: 100%; border-radius: 999px; background: var(--line-strong); border: 1px solid var(--frame); transition: background .15s; }
+.switch .track::after {
+  content: ""; position: absolute; top: 3px; left: 3px; width: 14px; height: 14px; border-radius: 50%;
+  background: var(--knob); box-shadow: 0 1px 2px rgba(0,0,0,.3); transition: transform .15s;
+}
+.switch input:checked + .track { background: var(--accent); }
+.switch input:checked + .track::after { transform: translateX(16px); background: var(--on-accent); }
+.switch input:focus-visible + .track { outline: 2px solid var(--edge); outline-offset: 2px; }
+
+/* Segmented control */
+.segmented { display: inline-flex; padding: 2px; border-radius: var(--radius-sm); background: var(--surface-2); border: 1px solid var(--frame); }
+.segmented label { position: relative; cursor: pointer; }
+.segmented input { position: absolute; opacity: 0; inset: 0; margin: 0; cursor: pointer; }
+.segmented span { display: inline-flex; align-items: center; height: 28px; padding: 0 12px; border-radius: 5px; font-size: 12px; font-weight: 550; color: var(--muted); white-space: nowrap; }
+.segmented input:checked + span { background: var(--accent); color: var(--on-accent); }
+.segmented input:focus-visible + span { outline: 2px solid var(--edge); }
+
+/* Check chips */
+.option-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.inline-check {
+  display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 10px;
+  border: 1px solid var(--line-strong); border-radius: var(--radius-sm); background: var(--surface);
+  font-size: 12px; color: var(--muted); cursor: pointer; white-space: nowrap;
+}
+.inline-check:has(input:checked) { border-color: var(--edge); background: var(--accent-soft); color: var(--accent); }
+.inline-check input[type=checkbox] { accent-color: var(--accent); width: 14px; height: 14px; }
+.inline-field select, .inline-field input { height: 26px; padding: 0 6px; border: 1px solid var(--line-strong); border-radius: 5px; font: inherit; font-size: 12px; background: var(--surface-2); color: var(--text); }
+.inline-field input[type=number] { width: 70px; }
+
+/* Tables */
+.table-wrap { overflow-x: auto; border: 1px solid var(--line-strong); border-radius: var(--radius); }
+.acct-table, .usage-table, .conn-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.acct-table { min-width: 860px; }
+.acct-table th, .acct-table td, .usage-table th, .usage-table td, .conn-table th, .conn-table td {
+  text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: middle;
+}
+.acct-table tbody tr:last-child td, .usage-table tbody tr:last-child td, .conn-table tbody tr:last-child td { border-bottom: none; }
+.acct-table th, .usage-table th, .conn-table th {
+  font-size: 12px; font-weight: 600; color: var(--muted); background: var(--surface-2);
+  border-bottom: 1px solid var(--line-strong);
+  position: sticky; top: 0; z-index: 1; white-space: nowrap;
+}
+.acct-table tbody tr:hover, .usage-table tbody tr:hover { background: var(--row-hover); }
+.acct-table tbody tr.active-row { background: var(--row-active); box-shadow: inset 3px 0 var(--edge); }
+.acct-table tbody tr.row-failed { background: var(--danger-soft); }
+.acct-table tbody tr.checkin-row-busy { opacity: .7; }
+.acct-cell { min-width: 0; }
+.acct-cell strong { font-weight: 600; }
+.status-cell { white-space: nowrap; }
+.status-cell .badge + .badge { margin-left: 4px; }
+.numeric { text-align: right !important; font-variant-numeric: tabular-nums; }
+.credit-value { font-family: var(--mono); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.muted-cell { color: var(--faint); font-size: 12px; white-space: nowrap; font-family: var(--mono); }
+.row-subtitle { display: block; color: var(--faint); font-size: 11px; margin-top: 2px; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.actions-col { width: 120px; }
+.row-actions { white-space: nowrap; }
+.row-actions .icon-btn + .icon-btn { margin-left: 4px; }
+.model-toggle-cell { min-width: 105px; white-space: nowrap; }
+.model-toggle-state { display: inline-flex; vertical-align: middle; margin-right: 8px; }
+.account-model-switch { vertical-align: middle; }
+.switch input:disabled { cursor: wait; }
+.switch input:disabled + .track { opacity: .6; }
+.empty-state { padding: 28px 12px; text-align: center; color: var(--faint); font-size: 13px; border: 1px dashed var(--frame); border-radius: var(--radius); }
+.usage-records-container { max-height: calc(100vh - 220px); min-height: 160px; overflow: auto; border: 1px solid var(--line-strong); border-radius: var(--radius); }
+.usage-table { min-width: 1280px; table-layout: fixed; }
+.usage-table th:nth-child(1) { width: 170px; }
+.usage-table th:nth-child(2) { width: 130px; }
+.usage-table th:nth-child(3) { width: 150px; }
+.usage-table th:nth-child(4) { width: 105px; }
+.usage-table th:nth-child(5) { width: 105px; }
+.usage-table th:nth-child(6) { width: 145px; }
+.usage-table th:nth-child(7) { width: 190px; }
+.usage-table th:nth-child(8) { width: 100px; }
+.usage-table th:nth-child(9) { width: 90px; }
+.usage-table th:nth-child(10) { width: 90px; }
+.usage-table td { overflow-wrap: anywhere; }
+.usage-table .usage-status { white-space: nowrap; }
+.usage-table .usage-meta { white-space: nowrap; }
+.usage-table .usage-tool { white-space: normal; }
+.usage-table .usage-meta.unknown { color: var(--faint); }
+.usage-table .usage-meta .usage-arrow { color: var(--faint); padding: 0 3px; }
+.usage-table .usage-meta .usage-sub { color: var(--muted); font-size: 11px; }
+.usage-model-cell { min-width: 0; }
+.usage-model-cell > div:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.usage-model-flags { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 4px; }
+.usage-flag {
+  display: inline-flex; align-items: center; min-height: 18px; padding: 0 5px;
+  border-radius: 4px; border: 1px solid var(--line-strong); background: var(--surface-2);
+  color: var(--muted); font-size: 10px; line-height: 16px; white-space: nowrap;
+}
+.usage-flag.max { color: var(--accent); border-color: var(--accent-line); background: var(--accent-soft); }
+.usage-flag.tool { color: var(--ok); border-color: var(--ok-line); background: var(--ok-soft); }
+.usage-flag.unknown { color: var(--faint); border-style: dashed; }
+.usage-empty { padding: 28px 12px; color: var(--faint); text-align: center; font-size: 13px; }
+.conn-wrap { margin-top: 14px; overflow-x: auto; border: 1px solid var(--line-strong); border-radius: var(--radius); }
+.conn-table { min-width: 640px; font-size: 12px; }
+.conn-table td { vertical-align: top; }
+.conn-table td.conn-detail { color: var(--muted); overflow-wrap: anywhere; font-family: var(--mono); font-size: 11px; }
+.conn-table .conn-reasoning { margin-top: 4px; white-space: pre-wrap; font-family: inherit; }
+.conn-status { white-space: nowrap; }
+.conn-status.ok { color: var(--ok); font-weight: 600; }
+.conn-status.fail { color: var(--danger); font-weight: 600; }
+.conn-status.pending { color: var(--muted); }
+.conn-time { white-space: nowrap; font-variant-numeric: tabular-nums; font-family: var(--mono); }
+
+/* Login & schedule */
+.login-steps { margin: 0 0 4px; padding-left: 18px; font-size: 12px; color: var(--muted); line-height: 1.8; }
+.login-steps code { background: var(--surface-2); border: 1px solid var(--line-strong); padding: 1px 5px; border-radius: 4px; font-size: 11px; color: var(--text); }
+.manual-add { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 12px; }
+.manual-add summary { font-size: 13px; color: var(--muted); cursor: pointer; font-weight: 550; }
+.manual-add summary:hover { color: var(--accent); }
+.manual-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0 12px; margin-top: 12px; }
+.manual-grid .span-all { grid-column: 1 / -1; }
+.manual-submit { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.manual-submit .msg { margin-top: 0; }
+.schedule-row { display: flex; align-items: center; gap: 12px 16px; flex-wrap: wrap; }
+.time-field { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
+.time-field input[type=time] { width: 112px; }
+.schedule-status { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 14px; padding: 12px 14px; background: var(--surface-2); border: 1px solid var(--line); border-left: 3px solid var(--edge); border-radius: var(--radius-sm); }
+.schedule-status div { min-width: 0; }
+.schedule-status dt { font-size: 11px; color: var(--faint); }
+.schedule-status dd { font-size: 13px; font-family: var(--mono); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.max-models { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; font-size: 12px; color: var(--muted); }
+.model-chip { border: 1px solid var(--line-strong); background: var(--surface); color: var(--text); border-radius: var(--radius-sm); height: 28px; padding: 0 9px; font: inherit; font-family: var(--mono); font-size: 12px; cursor: pointer; }
+.model-chip:hover { border-color: var(--edge); color: var(--accent); background: var(--accent-soft); }
+pre.code-out { margin-top: 12px; padding: 12px; background: var(--side-bg); color: #b8f5cd; border: 1px solid var(--frame); border-radius: var(--radius-sm); font-family: var(--mono); font-size: 12px; max-height: 360px; overflow: auto; white-space: pre-wrap; display: none; }
+
+/* Feedback */
+.msg { margin-top: 12px; padding: 8px 12px; border-radius: var(--radius-sm); font-size: 13px; display: none; line-height: 1.45; white-space: pre-wrap; }
+.msg-ok { background: var(--ok-soft); color: var(--ok); display: block; border: 1px solid var(--ok-line); }
+.msg-err { background: var(--danger-soft); color: var(--danger); display: block; border: 1px solid var(--danger-line); }
+.msg-pending { background: var(--warn-soft); color: var(--warn); display: block; border: 1px solid var(--warn-line); }
+.inline-msg { margin-top: 0; }
+.account-msgs .msg { margin-top: 10px; }
+.loading { margin-top: 12px; display: none; font-size: 13px; color: var(--muted); }
+.busy-indicator { display: none; color: var(--muted); font-size: 12px; align-items: center; gap: 6px; }
+.busy-indicator.visible { display: inline-flex; }
+.busy-indicator::before { content: ""; width: 10px; height: 10px; border: 2px solid var(--line-strong); border-top-color: var(--edge); border-radius: 50%; animation: relay-spin .7s linear infinite; }
+@keyframes relay-spin { to { transform: rotate(360deg); } }
+.toast { position: fixed; top: 16px; right: 16px; z-index: 30; width: min(400px, calc(100vw - 32px)); padding: 12px 14px; border: 1px solid var(--frame); border-left: 4px solid var(--ok); border-radius: var(--radius); background: var(--surface); color: var(--text); box-shadow: var(--shadow); opacity: 0; transform: translateY(-8px); pointer-events: none; transition: opacity .18s, transform .18s; white-space: pre-wrap; line-height: 1.45; font-size: 13px; }
+.toast.visible { opacity: 1; transform: translateY(0); }
+.toast.error { border-left-color: var(--danger); }
+.toast-title { display: block; font-size: 12px; font-weight: 650; margin-bottom: 2px; color: var(--ok); }
+.toast.error .toast-title { color: var(--danger); }
+
+/* Overview */
+.stats.stats-6 { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+.stat dd.stat-sub { font-size: 11px; font-weight: 400; color: var(--faint); font-family: inherit; }
+.ov-grid { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 16px; align-items: start; }
+.chart-readout { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; min-height: 40px; padding: 8px 12px; margin-bottom: 12px; background: var(--surface-2); border: 1px solid var(--line); border-left: 3px solid var(--edge); border-radius: var(--radius-sm); font-size: 12px; color: var(--muted); }
+.chart-readout strong { color: var(--text); font-family: var(--mono); font-weight: 650; }
+.readout-date { color: var(--text); font-weight: 650; font-family: var(--mono); min-width: 84px; }
+.readout-item { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.swatch { width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; }
+.sw-in { background: var(--chart-in); } .sw-cache { background: var(--chart-cache); } .sw-out { background: var(--chart-out); }
+.chart-wrap { display: grid; grid-template-columns: 52px minmax(0, 1fr); column-gap: 8px; }
+.chart-y { display: flex; flex-direction: column; justify-content: space-between; height: 220px; font-size: 10px; color: var(--faint); font-family: var(--mono); text-align: right; }
+.chart-y span { line-height: 1; transform: translateY(-50%); }
+.chart-y span:last-child { transform: none; }
+.chart {
+  height: 220px; display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 3px; align-items: end;
+  border-bottom: 1px solid var(--line-strong);
+  background-image: linear-gradient(to bottom, var(--line) 1px, transparent 1px); background-size: 100% 25%;
+}
+.bar-col { height: 100%; display: flex; justify-content: center; cursor: pointer; border-radius: 3px 3px 0 0; outline: none; transition: background .15s; }
+.bar-col:hover, .bar-col:focus-visible { background: var(--accent-soft); }
+.bar-col.sel { background: var(--row-active); box-shadow: inset 0 -2px var(--edge); }
+.bar-col:focus-visible { box-shadow: inset 0 0 0 2px var(--edge); }
+.bar-stack { width: min(70%, 22px); height: 100%; display: flex; flex-direction: column; justify-content: flex-end; }
+.bar-seg { display: block; width: 100%; height: 0; transition: height .55s var(--ease-out); }
+.seg-out { background: var(--chart-out); border-radius: 3px 3px 0 0; }
+.seg-in { background: var(--chart-in); }
+.seg-cache { background: var(--chart-cache); }
+.chart-axis { grid-column: 2; display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 3px; margin-top: 6px; font-size: 10px; color: var(--faint); font-family: var(--mono); }
+.chart-axis span { text-align: center; white-space: nowrap; overflow: visible; }
+.chart-empty { grid-column: 2; padding: 6px 0 0; font-size: 12px; color: var(--faint); }
+.kv-list { display: flex; flex-direction: column; }
+.kv-list div { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 0; border-bottom: 1px solid var(--line); min-width: 0; }
+.kv-list div:last-child { border-bottom: none; }
+.kv-list dt { font-size: 12px; color: var(--muted); display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.kv-list dd { font-size: 12px; font-family: var(--mono); color: var(--text); text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.day-wrap { max-height: 440px; overflow: auto; border: 1px solid var(--line-strong); border-radius: var(--radius); }
+.day-table { width: 100%; min-width: 680px; border-collapse: collapse; font-size: 12px; }
+.day-table th, .day-table td { padding: 8px 12px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.day-table th:first-child, .day-table td:first-child { text-align: left; }
+.day-table th { font-weight: 600; color: var(--muted); background: var(--surface-2); border-bottom: 1px solid var(--line-strong); position: sticky; top: 0; z-index: 1; }
+.day-table td { font-family: var(--mono); }
+.day-table tbody tr { cursor: pointer; transition: background .15s, box-shadow .25s var(--ease-out); }
+.day-table tbody tr:hover { background: var(--row-hover); }
+.day-table tbody tr.sel { background: var(--row-active); box-shadow: inset 3px 0 var(--edge); }
+.day-table tbody tr.zero td { color: var(--faint); }
+.day-table tfoot td { font-weight: 650; background: var(--surface-2); border-top: 1px solid var(--line-strong); border-bottom: none; position: sticky; bottom: 0; }
+.day-table .badge { margin-left: 6px; font-family: inherit; }
+@media (max-width: 1280px) { .stats.stats-6 { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@media (max-width: 1080px) { .ov-grid { grid-template-columns: minmax(0, 1fr); } }
+@media (max-width: 820px) {
+  .stats.stats-6 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .chart, .chart-y { height: 180px; }
+  .chart-wrap { grid-template-columns: 40px minmax(0, 1fr); column-gap: 6px; }
+  .chart, .chart-axis { gap: 2px; }
+}
+
+/* Selection motion */
+:root { --ease-out: cubic-bezier(.22,1,.36,1); --ease-spring: cubic-bezier(.34,1.56,.64,1); }
+.nav-list { position: relative; }
+.nav-item { z-index: 1; }
+.nav-item svg { transition: transform .28s var(--ease-spring); }
+.nav-item:hover svg { transform: translateX(2px); }
+.nav-item.active svg { transform: scale(1.12); }
+.nav-indicator {
+  position: absolute; left: 0; top: 0; width: 0; height: 0; z-index: 0; opacity: 0; pointer-events: none;
+  border-radius: var(--radius-sm); background: var(--side-active); border: 1px solid rgba(74,222,128,.45);
+}
+.nav-indicator::before {
+  content: ""; position: absolute; left: -11px; top: 7px; bottom: 7px; width: 3px;
+  border-radius: 0 3px 3px 0; background: var(--side-accent); box-shadow: 0 0 10px rgba(74,222,128,.55);
+}
+.nav-indicator.ready { transition: transform .34s var(--ease-out), width .34s var(--ease-out), height .34s var(--ease-out), opacity .2s; }
+.has-indicator .nav-item.active, .has-indicator .nav-item.active:hover { background: transparent; border-color: transparent; }
+.has-indicator .nav-item.active::before { display: none; }
+
+.segmented { position: relative; }
+.segmented label { z-index: 1; }
+.segmented span { transition: color .2s, transform .15s var(--ease-spring); }
+.segmented label:active span { transform: scale(.95); }
+.seg-thumb {
+  position: absolute; left: 0; top: 0; width: 0; height: 0; z-index: 0; opacity: 0; pointer-events: none;
+  border-radius: 5px; background: var(--accent); box-shadow: 0 1px 3px rgba(0,0,0,.25);
+}
+.seg-thumb.ready { transition: transform .32s var(--ease-out), width .32s var(--ease-out), opacity .2s; }
+.has-thumb input:checked + span { background: transparent; }
+
+.switch .track { transition: background .2s, box-shadow .2s; }
+.switch .track::after { transition: transform .3s var(--ease-spring), width .16s ease, background .2s; }
+.switch:active .track::after { width: 18px; }
+.switch input:checked:active + .track::after { transform: translateX(12px); }
+.switch input:checked + .track { box-shadow: 0 0 0 3px var(--ring); }
+
+.inline-check { transition: border-color .15s, background .15s, color .15s, transform .12s; }
+.inline-check:active { transform: scale(.97); }
+.inline-check:has(input:checked) { animation: sel-pop .32s var(--ease-spring); }
+@keyframes sel-pop { 0% { transform: scale(.95); } 60% { transform: scale(1.04); } 100% { transform: scale(1); } }
+
+.model-chip { transition: border-color .12s, color .12s, background .12s, transform .12s; }
+.btn:active:not(:disabled), .icon-btn:active:not(:disabled), .model-chip:active { transform: scale(.96); }
+
+.acct-table tbody tr { transition: background .2s, box-shadow .25s var(--ease-out); }
+.acct-table tbody tr.active-row { animation: row-select .6s var(--ease-out); }
+@keyframes row-select { 0% { background: var(--accent-soft); box-shadow: inset 0 0 var(--edge); } 100% { box-shadow: inset 3px 0 var(--edge); } }
+
+.theme-icon svg { transition: transform .45s var(--ease-spring); transform: scale(.85); }
+[data-theme="light"] .theme-sun svg { transform: rotate(180deg) scale(1.1); }
+[data-theme="dark"] .theme-moon svg { transform: rotate(-20deg) scale(1.1); }
+html.theme-anim *, html.theme-anim *::before, html.theme-anim *::after {
+  transition: background-color .3s ease, border-color .3s ease, color .3s ease, box-shadow .3s ease, transform .3s var(--ease-spring) !important;
+}
+@media (max-width: 820px) {
+  .nav-indicator::before { left: 10px; right: 10px; top: auto; bottom: 3px; width: auto; height: 2px; border-radius: 2px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}
+@media (max-width: 1080px) {
+  .panel-grid.cols-2 { grid-template-columns: minmax(0, 1fr); }
+  .manual-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 820px) {
+  .app { grid-template-columns: minmax(0, 1fr); }
+  .sidebar { position: sticky; top: 0; z-index: 10; height: auto; flex-direction: row; align-items: center; border-right: none; border-bottom: 2px solid var(--edge); overflow: visible; }
+  .brand { padding: 10px 12px; border-bottom: none; }
+  .brand-block { display: none; }
+  .nav-list { flex-direction: row; overflow-x: auto; padding: 8px 8px 8px 0; flex: 1; scrollbar-width: none; }
+  .nav-item { width: auto; white-space: nowrap; height: 34px; padding: 0 10px; }
+  .nav-item.active::before { display: none; }
+  .sidebar-foot { display: none; }
+  .topbar { position: static; padding: 12px 14px; }
+  .content { padding: 14px 14px 36px; }
+  .panel-card { padding: 16px 14px 14px; }
+  .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .stat dd { font-size: 18px; }
+  .manual-grid { grid-template-columns: minmax(0, 1fr); }
+  .schedule-status { grid-template-columns: minmax(0, 1fr); }
+  .toolbar .btn { flex: 1 1 140px; }
+  .toolbar .spacer { display: none; }
+}"""
+
+
+def _status_badge() -> str:
+    s = auth.get_auth()
+    if s.token and s.is_valid():
+        return '<span class="badge badge-ok">\u5df2\u767b\u5f55</span>'
+    if s.token:
+        return '<span class="badge badge-expired">\u5df2\u8fc7\u671f</span>'
+    return '<span class="badge badge-none">\u672a\u767b\u5f55</span>'
+
+
+def _web_login_html() -> str:
+    s = auth.get_auth()
+    client_id = TRAE_CLIENT_ID
+    listener_port = LOCAL_LISTENER_PORT
+    auth_url = html_mod.escape(TRAE_AUTH_URL)
+    state = s
+    accounts = auth.list_accounts()
+    polling = auth.get_polling_status()
+    settings = auth.get_settings()
+    auto_route_on = _auto_route_enabled()
+
+    # Header status chips; the active-user chip is updated in place by JS.
+    upstream_label = AUTO_ROUTE_MODE if auto_route_on else _current_upstream_mode()
+    status_html = f"""
+    <div class="status-chips">
+      {_status_badge()}
+      <span id="active-user-id" class="chip chip-user"{' hidden' if not state.user_id else ''}>{f'用户: {html_mod.escape(state.user_id)}' if state.user_id else ''}</span>
+      <span class="chip" title="凭据来源"><span class="chip-key">源</span><code>{html_mod.escape(state.source)}</code></span>
+      <span class="chip" title="当前上游模式"><span class="chip-key">上游</span><code>{html_mod.escape(upstream_label)}</code></span>
+      <span class="chip"><span class="chip-key">轮询</span><code>{'开' if polling.get('enabled') else '关'}</code></span>
+    </div>"""
+
+    # Consumption history is rendered in its own panel below the account list.
+    usage_records_html = """
+    <div id="usage-records-container" class="usage-records-container">
+      <table class="usage-table">
+        <thead>
+          <tr>
+            <th>时间</th>
+            <th>账号</th>
+            <th>模型</th>
+            <th>思考强度</th>
+            <th>上下文模式</th>
+            <th>Max 模式</th>
+            <th>Tool 参数</th>
+            <th class="numeric">Tokens（入 / 出 / 总）</th>
+            <th class="numeric">消耗积分</th>
+            <th>状态</th>
+          </tr>
+        </thead>
+        <tbody id="usage-records-body"></tbody>
+      </table>
+      <div id="usage-empty" class="usage-empty">暂无消费记录</div>
+    </div>"""
+
+    ic = {name: _icon(name) for name in _LUCIDE_ICONS}
+
+    # 账号列表
+    rows = ""
+    stat_valid = 0
+    stat_checked = 0
+    stat_remaining = 0.0
+    stat_known = False
+    stat_unlimited = False
+    for acc in accounts:
+        if acc.get("is_valid"):
+            st = '<span class="badge badge-ok">有效</span>'
+            stat_valid += 1
+        else:
+            st = '<span class="badge badge-expired">无效</span>'
+        act = (
+            '<span class="badge badge-active" data-account-active>当前</span>'
+            if acc.get("is_active")
+            else '<span class="badge badge-active" data-account-active hidden>当前</span>'
+        )
+        active_row = "active-row" if acc.get("is_active") else ""
+        switch_disabled = " disabled" if acc.get("is_active") else ""
+        aid = html_mod.escape(acc.get("id") or "")
+        model_enabled = bool(acc.get("model_enabled", True))
+        model_checked = " checked" if model_enabled else ""
+        model_badge = (
+            '<span class="badge badge-ok" id="model-state-%s">已开启</span>'
+            % aid
+            if model_enabled
+            else '<span class="badge badge-none" id="model-state-%s">已关闭</span>' % aid
+        )
+        label = html_mod.escape(acc.get("label") or acc.get("user_id") or acc.get("id") or "")
+        uid = html_mod.escape(acc.get("user_id") or acc.get("id") or "")
+        expires = html_mod.escape((acc.get("expires") or "")[:16])
+        account_credits = acc.get("account_credits") or {}
+        if account_credits.get("unlimited"):
+            credits_text = "☆ 无限"
+            stat_unlimited = True
+        elif account_credits.get("remaining") is not None:
+            remaining = float(account_credits["remaining"])
+            credits_text = f"剩{remaining:.2f}/总{float(account_credits.get('total_limit') or 0):.2f}"
+            stat_remaining += remaining
+            stat_known = True
+        else:
+            credits_text = "-"
+        checked_in = acc.get("checked_in")
+        if checked_in is True:
+            checkin_badge = '<span class="badge badge-ok">已签到</span>'
+            stat_checked += 1
+        elif checked_in is False:
+            checkin_badge = '<span class="badge badge-active">未签到</span>'
+        else:
+            checkin_badge = '<span class="badge badge-none">未知</span>'
+        valid_flag = "1" if acc.get("is_valid") else "0"
+        rows += f"""<tr id="row-{aid}" class="{active_row}" data-account-id="{aid}" data-valid="{valid_flag}" data-model-enabled="{'1' if model_enabled else '0'}">
+          <td><div class="acct-cell"><strong id="label-{aid}">{label}</strong><small class="row-subtitle mono">{uid}</small></div></td>
+          <td class="status-cell">{st}{act}</td>
+          <td class="muted-cell">{expires}</td>
+          <td class="numeric"><span id="general-credits-{aid}" class="credit-value">{credits_text}</span></td>
+          <td><span id="checkin-{aid}" class="checkin-state">{checkin_badge}</span><small id="checkin-detail-{aid}" class="row-subtitle"></small></td>
+          <td class="model-toggle-cell"><div id="model-state-wrap-{aid}" class="model-toggle-state">{model_badge}</div><label class="switch account-model-switch" title="仅控制模型请求，不影响签到"><input type="checkbox" data-action="model-toggle" onchange="markAccountModelDirty('{aid}', this)" aria-label="启用账号模型请求"{model_checked}><span class="track"></span></label></td>
+          <td class="row-actions">
+            <button class="icon-btn" data-action="checkin" onclick="checkinAccount('{aid}')" title="签到" aria-label="签到">{ic['calendar-check']}</button>
+            <button class="icon-btn" data-action="switch-account" onclick="switchAccount('{aid}')" title="切换为当前账号" aria-label="切换为当前账号"{switch_disabled}>{ic['arrow-left-right']}</button>
+            <button class="icon-btn danger" onclick="removeAccount('{aid}')" title="删除账号" aria-label="删除账号">{ic['trash-2']}</button>
+          </td>
+        </tr>"""
+    if accounts:
+        accounts_html = f"""<div class="table-wrap">
+          <table class="acct-table">
+            <thead><tr><th>账号</th><th>状态</th><th>有效期</th><th class="numeric">通用积分</th><th>签到状态</th><th>模型请求</th><th class="actions-col">操作</th></tr></thead>
+            <tbody>{rows}</tbody>
+          </table>
+        </div>"""
+    else:
+        accounts_html = '<div class="empty-state">暂无账号，请先授权登录或手动添加。</div>'
+    # The toolbar stays in the DOM before the first login so the same script
+    # handles an account list that becomes populated later.
+    toolbar_hidden = "" if accounts else " hidden"
+    stat_total = len(accounts)
+    if stat_unlimited:
+        stat_credits = "无限"
+    elif stat_known:
+        stat_credits = f"{stat_remaining:.2f}"
+    else:
+        stat_credits = "-"
+
+    logout_btn = ''
+    if state.token:
+        logout_btn = f'<button class="icon-btn" onclick="logout()" title="登出" aria-label="登出">{ic["log-out"]}</button>'
+
+    settings_web = (settings.get("web_base_url") or WEB_BASE).rstrip("/")
+    settings_port = settings.get("relay_port") or os.environ.get("RELAY_PORT") or PORT
+    # Remote/Work Agent and IDE Agent intentionally share upstream base URLs.
+    # Select by mode as well as URL; URL-only matching can otherwise render a
+    # different protocol after a reload.  IDE Raw is deliberately absent from
+    # the public preset list because personal accounts consistently receive
+    # ``2001 failed to get app config: record not found``; the raw transport
+    # remains available only for internal protocol diagnostics.
+    selected_endpoint_id = str(settings.get("endpoint_id") or "").strip().lower()
+    selected_mode = str(
+        settings.get("upstream_mode") or _current_upstream_mode() or ""
+    ).strip().lower()
+    selected_mode = {
+        # Legacy values are kept readable in the settings store, but the
+        # public UI no longer exposes the unsupported personal-account Raw
+        # preset.  A stale raw selection is shown as custom until the user
+        # explicitly chooses a supported endpoint.
+        "direct": "raw",
+        "auto": "raw",
+        "9router": "remote",
+        "trae-remote": "remote",
+        "web": "remote",
+    }.get(selected_mode, selected_mode)
+    url_matches = [
+        item
+        for item in UPSTREAM_ENDPOINT_PRESETS
+        if settings_web == str(item["base_url"]).rstrip("/")
+    ]
+    # Prefer the persisted preset identity.  Raw/IDE Agent and Remote/Work
+    # Agent deliberately share URLs, so selecting by URL or by the first
+    # matching mode can silently render the wrong option after a reload.
+    matched_endpoint = next(
+        (
+            item
+            for item in UPSTREAM_ENDPOINT_PRESETS
+            if str(item.get("id") or "").strip().lower() == selected_endpoint_id
+            and settings_web == str(item.get("base_url") or "").rstrip("/")
+        ),
+        None,
+    )
+    if matched_endpoint is None:
+        matched_endpoint = next(
+            (item for item in url_matches if item["mode"] == selected_mode),
+            None,
+        )
+    if matched_endpoint is None and len(url_matches) == 1:
+        matched_endpoint = url_matches[0]
+    # Custom URLs that aren't in the preset list still appear as saved options.
+    custom_is_saved = bool(settings.get("web_base_url")) and not matched_endpoint
+    custom_selected = " selected" if not matched_endpoint else ""
+    endpoint_options = [f'<option value=""{custom_selected}>自定义</option>']
+    if custom_is_saved:
+        endpoint_options.append(
+            f'<option value="__saved" selected>{html_mod.escape(settings_web)}</option>'
+        )
+    for item in UPSTREAM_ENDPOINT_PRESETS:
+        selected = " selected" if matched_endpoint and matched_endpoint["id"] == item["id"] else ""
+        endpoint_options.append(
+            f'<option value="{html_mod.escape(item["id"])}"{selected}>{html_mod.escape(item["label"])}</option>'
+        )
+    endpoint_options_html = "".join(endpoint_options)
+    endpoint_map_json = json.dumps(
+        {
+            item["id"]: {
+                "base_url": item["base_url"],
+                "mode": item["mode"],
+                "endpoint_url": item.get("endpoint_url") or item["base_url"],
+                "endpoint_path": item.get("endpoint_path") or "",
+            }
+            for item in UPSTREAM_ENDPOINT_PRESETS
+        },
+        ensure_ascii=False,
+    )
+    poll_checked = 'checked' if polling.get("enabled") else ''
+    poll_mode_rr = 'checked' if polling.get('mode', 'round-robin') == 'round-robin' else ''
+    poll_mode_cp = 'checked' if polling.get('mode') == 'credit-priority' else ''
+    max_settings = auth.get_max_mode_settings()
+    max_checked = 'checked' if max_settings.get('enabled') else ''
+    max_models = html_mod.escape(max_settings.get('models') or '')
+    max_state_text = '已开启' if max_settings.get('enabled') else '已关闭'
+    auto_route_checked = 'checked' if auto_route_on else ''
+    auto_route_state_text = '已开启' if auto_route_on else '已关闭'
+    auto_checkin = auth.get_auto_checkin_settings()
+    auto_checkin_checked = 'checked' if auto_checkin.get('enabled') else ''
+    auto_checkin_time = html_mod.escape(auto_checkin.get('time') or '08:30')
+    poll_pill = ' on' if polling.get('enabled') else ''
+    auto_route_pill = ' on' if auto_route_on else ''
+    max_pill = ' on' if max_settings.get('enabled') else ''
+    auto_checkin_pill = ' on' if auto_checkin.get('enabled') else ''
+    auto_checkin_state_text = (
+        f"每天 {auto_checkin_time} 自动签到" if auto_checkin.get('enabled') else '已关闭'
+    )
+
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Trae CN Relay 控制台</title>
+{_FAVICON_LINKS}
+<script>
+(function(){{
+  try {{
+    var t = localStorage.getItem('relay-theme');
+    if (t !== 'dark' && t !== 'light') t = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    document.documentElement.setAttribute('data-theme', t);
+  }} catch (e) {{ document.documentElement.setAttribute('data-theme', 'light'); }}
+}})();
+</script>
+<style>
+{_CONSOLE_CSS}
+</style>
+</head>
+<body>
+<div id="toast" class="toast" role="alert" aria-live="assertive"><span id="toast-title" class="toast-title"></span><span id="toast-text"></span></div>
+<div class="app">
+<aside class="sidebar">
+  <div class="brand">
+    <span class="brand-mark">{_LOGO_SVG_INLINE}</span>
+    <div class="brand-block">
+      <h1>Trae CN Relay</h1>
+      <span class="brand-sub">控制台</span>
+    </div>
+  </div>
+  <nav class="nav-list" role="tablist" aria-label="功能导航">
+    <button class="nav-item active" role="tab" data-tab="overview" data-title="概览" onclick="switchTab('overview')">{ic['layout-dashboard']}<span>概览</span></button>
+    <button class="nav-item" role="tab" data-tab="accounts" data-title="账号与签到" onclick="switchTab('accounts')">{ic['users']}<span>账号与签到</span></button>
+    <button class="nav-item" role="tab" data-tab="usage" data-title="消费记录" onclick="switchTab('usage')">{ic['receipt']}<span>消费记录</span></button>
+    <button class="nav-item" role="tab" data-tab="settings" data-title="轮询与设置" onclick="switchTab('settings')">{ic['sliders-horizontal']}<span>轮询与设置</span></button>
+    <button class="nav-item" role="tab" data-tab="models" data-title="模型测试" onclick="switchTab('models')">{ic['activity']}<span>模型测试</span></button>
+  </nav>
+  <div class="sidebar-foot"><span>Trae2api-cn</span><span>v{APP_VERSION}</span></div>
+</aside>
+<main class="main">
+<header class="topbar">
+  <h2 id="page-title">概览</h2>
+  <div class="topbar-right">
+    {status_html}
+    <label class="theme-switch" title="夜间模式">
+      <span class="theme-icon theme-sun">{ic['sun']}</span>
+      <span class="switch"><input type="checkbox" id="theme-toggle" role="switch" aria-label="夜间模式" onchange="applyTheme(this.checked?'dark':'light',true)"><span class="track"></span></span>
+      <span class="theme-icon theme-moon">{ic['moon']}</span>
+    </label>
+    {logout_btn}
+  </div>
+</header>
+<div class="content">
+
+<div class="tab-page active" data-page="overview">
+<div class="panel-stack">
+<dl class="stats stats-6" aria-label="用量概览">
+  <div class="stat"><dt>{ic['sigma']}累计 Token</dt><dd id="ov-total">--</dd><dd class="stat-sub" id="ov-total-sub">--</dd></div>
+  <div class="stat"><dt>{ic['arrow-down-to-line']}累计输入</dt><dd id="ov-input">--</dd><dd class="stat-sub" id="ov-input-sub">--</dd></div>
+  <div class="stat"><dt>{ic['arrow-up-from-line']}累计输出</dt><dd id="ov-output">--</dd><dd class="stat-sub" id="ov-output-sub">--</dd></div>
+  <div class="stat"><dt>{ic['database']}累计缓存</dt><dd id="ov-cache">--</dd><dd class="stat-sub" id="ov-cache-sub">--</dd></div>
+  <div class="stat"><dt>{ic['calendar']}今日 Token</dt><dd id="ov-today">--</dd><dd class="stat-sub" id="ov-today-sub">--</dd></div>
+  <div class="stat"><dt>{ic['users']}有效账号</dt><dd id="ov-accounts">--</dd><dd class="stat-sub" id="ov-accounts-sub">--</dd></div>
+</dl>
+<div id="ov-msg" class="msg" role="status" aria-live="polite"></div>
+<div class="ov-grid">
+<section class="panel-card" aria-labelledby="ov-chart-title">
+  <div class="section-head">
+    <div><div class="section-title" id="ov-chart-title">每日 Token 用量</div><span id="ov-updated" class="section-meta"></span></div>
+    <div class="segmented" role="radiogroup" aria-label="统计范围">
+      <label><input type="radio" name="ov-range" value="7" onchange="setOverviewRange(this.value)"><span>7 天</span></label>
+      <label><input type="radio" name="ov-range" value="14" onchange="setOverviewRange(this.value)" checked><span>14 天</span></label>
+      <label><input type="radio" name="ov-range" value="30" onchange="setOverviewRange(this.value)"><span>30 天</span></label>
+    </div>
+  </div>
+  <div id="ov-readout" class="chart-readout" aria-live="polite"></div>
+  <div class="chart-wrap">
+    <div class="chart-y" aria-hidden="true"><span id="ov-y-max">0</span><span id="ov-y-mid">0</span><span>0</span></div>
+    <div id="ov-chart" class="chart" role="group" aria-label="每日 Token 柱状图"></div>
+    <div id="ov-axis" class="chart-axis" aria-hidden="true"></div>
+  </div>
+</section>
+<section class="panel-card" aria-labelledby="ov-service-title">
+  <div class="section-head"><div class="section-title" id="ov-service-title">服务状态</div></div>
+  <dl class="kv-list">
+    <div><dt>{ic['shield-check']}登录凭据</dt><dd id="ov-token">--</dd></div>
+    <div><dt>{ic['server']}版本</dt><dd id="ov-version">v{APP_VERSION}</dd></div>
+    <div><dt>{ic['activity']}运行时长</dt><dd id="ov-uptime">--</dd></div>
+    <div><dt>{ic['arrow-left-right']}上游端点</dt><dd id="ov-upstream">--</dd></div>
+    <div><dt>{ic['refresh-cw']}多账号轮询</dt><dd id="ov-polling">--</dd></div>
+    <div><dt>{ic['zap']}1M 上下文</dt><dd id="ov-max">--</dd></div>
+    <div><dt>{ic['calendar-check']}自动签到</dt><dd id="ov-autocheckin">--</dd></div>
+    <div><dt>{ic['list']}进行中请求</dt><dd id="ov-inflight">--</dd></div>
+    <div><dt>{ic['coins']}剩余通用积分</dt><dd id="ov-credits">--</dd></div>
+  </dl>
+</section>
+</div>
+<section class="panel-card" aria-labelledby="ov-days-title">
+  <div class="section-head">
+    <div><div class="section-title" id="ov-days-title">按日期汇总</div><span id="ov-days-meta" class="section-meta"></span></div>
+    <label class="inline-check"><input type="checkbox" id="ov-hide-empty" onchange="renderOverviewDays()">隐藏无请求日期</label>
+  </div>
+  <div class="day-wrap">
+    <table class="day-table">
+      <thead><tr><th>日期</th><th>请求</th><th>失败</th><th>输入</th><th>输出</th><th>缓存</th><th>总计</th><th>Max 请求/生效</th><th>Tool 请求/调用</th><th>积分</th></tr></thead>
+      <tbody id="ov-days-body"></tbody>
+      <tfoot><tr id="ov-days-foot"></tr></tfoot>
+    </table>
+  </div>
+</section>
+</div>
+</div>
+
+<div class="tab-page" data-page="accounts">
+<div class="panel-stack">
+<dl class="stats" aria-label="账号概览">
+  <div class="stat"><dt>{ic['users']}账号</dt><dd id="stat-total">{stat_total}</dd></div>
+  <div class="stat"><dt>{ic['shield-check']}有效</dt><dd id="stat-valid">{stat_valid}</dd></div>
+  <div class="stat"><dt>{ic['check-check']}今日已签到</dt><dd id="stat-checked">{stat_checked}</dd></div>
+  <div class="stat"><dt>{ic['coins']}剩余通用积分</dt><dd id="stat-credits">{stat_credits}</dd></div>
+</dl>
+<section class="panel-card" aria-label="账号列表">
+  <div class="section-head">
+    <div><div class="section-title">账号列表</div><span id="checkin-summary" class="section-meta">{stat_total} 个账号</span><span id="checkin-updated" class="section-meta"></span></div>
+    <div class="toolbar account-toolbar"{toolbar_hidden} aria-live="polite">
+      <span id="checkin-busy" class="busy-indicator" role="status" aria-live="polite">正在处理...</span>
+      <button class="btn btn-secondary btn-sm" id="checkin-status-refresh-btn" onclick="checkinRefreshAll()">{ic['refresh-cw']}查询签到状态</button>
+      <button class="btn btn-secondary btn-sm" id="credits-refresh-btn" onclick="creditsRefreshAll()">{ic['coins']}查询全部积分</button>
+      <button class="btn btn-primary btn-sm" id="checkin-claim-btn" onclick="checkinClaimAll()">{ic['calendar-check']}一键轮询签到</button>
+      <button class="btn btn-secondary btn-sm" id="account-model-save-btn" onclick="saveAccountModelSettings()" disabled>{ic['save']}保存模型开关</button>
+    </div>
+  </div>
+  {accounts_html}
+  <div class="account-msgs">
+    <div id="account-msg" class="msg" role="status" aria-live="polite"></div>
+    <div id="checkin-msg" class="msg" role="status" aria-live="polite"></div>
+  </div>
+</section>
+<div class="panel-grid cols-2">
+<section class="panel-card" aria-labelledby="login-title">
+  <div class="section-head"><div class="section-title" id="login-title">授权登录</div></div>
+  <ol class="login-steps">
+    <li>点击授权登录，自动检测本机授权助手（<code>127.0.0.1:{listener_port}</code>）。</li>
+    <li>未检测到时，下载 <code>web_login.py</code> 或 <code>start_auth.bat</code> 在<b>本机</b>运行后重试。</li>
+    <li>浏览器需已登录 <a href="https://www.trae.cn" target="_blank" rel="noopener">trae.cn</a>，授权完成后凭据自动写入服务器。</li>
+  </ol>
+  <div class="btn-group">
+    <button class="btn btn-primary" onclick="startAuth()" id="auth-btn">{ic['log-in']}使用 Trae 网页授权登录</button>
+    <a class="btn btn-secondary" href="/web/login/download" download>{ic['download']}授权助手 web_login.py</a>
+    <a class="btn btn-secondary" href="/web/login/download?as=bat" download id="bat-link" style="display:none">{ic['download']}start_auth.bat</a>
+    <a class="icon-btn" href="https://www.trae.cn" target="_blank" rel="noopener" title="访问 trae.cn" aria-label="访问 trae.cn">{ic['external-link']}</a>
+  </div>
+  <div id="loading" class="loading">等待授权中...</div>
+  <div id="auth-msg" class="msg"></div>
+  <details class="manual-add">
+    <summary>手动填写凭证添加账号</summary>
+    <form id="manual-form" class="manual-grid">
+      <div class="form-group span-all">
+        <label for="manual-token">Token（Cloud-IDE-JWT）<span class="required">*</span></label>
+        <textarea id="manual-token" name="token" required placeholder="eyJhbGciOiJSUzI1NiI6Ik9wZW5TU0..."></textarea>
+      </div>
+      <div class="form-group">
+        <label for="manual-refresh">Refresh Token</label>
+        <input id="manual-refresh" name="refreshToken" placeholder="可选">
+      </div>
+      <div class="form-group">
+        <label for="manual-uid">User ID</label>
+        <input id="manual-uid" name="userId" placeholder="可选">
+      </div>
+      <div class="form-group">
+        <label for="manual-cid">Client ID</label>
+        <input id="manual-cid" name="clientId" value="{html_mod.escape(client_id)}">
+      </div>
+      <div class="form-group">
+        <label for="manual-label">备注</label>
+        <input id="manual-label" name="label" placeholder="可选">
+      </div>
+      <div class="span-all manual-submit">
+        <button type="submit" class="btn btn-primary btn-sm">添加账号</button>
+        <div id="manual-msg" class="msg"></div>
+      </div>
+    </form>
+  </details>
+</section>
+<section class="panel-card" id="auto-checkin-panel" aria-labelledby="auto-checkin-title">
+  <div class="section-head">
+    <div class="section-title" id="auto-checkin-title">自动签到</div>
+    <span id="auto-checkin-state" class="state-pill{auto_checkin_pill}">{auto_checkin_state_text}</span>
+  </div>
+  <div class="switch-row">
+    <div class="switch-text"><strong>定时签到</strong><span>每天按设定时间依次签到所有账号，已签到账号自动跳过</span></div>
+    <label class="switch" title="启用定时签到">
+      <input type="checkbox" id="auto-checkin-toggle" {auto_checkin_checked} onchange="markAutoCheckinDirty()" aria-label="启用定时签到"><span class="track"></span>
+    </label>
+  </div>
+  <div class="schedule-row">
+    <label class="time-field" for="auto-checkin-time">每天（北京时间）
+      <input class="control" type="time" id="auto-checkin-time" value="{auto_checkin_time}" step="60" required oninput="markAutoCheckinDirty()">
+    </label>
+    <div class="toolbar">
+      <button class="btn btn-primary btn-sm" id="auto-checkin-save-btn" onclick="saveAutoCheckin()" disabled>{ic['save']}保存</button>
+      <button class="btn btn-secondary btn-sm" id="auto-checkin-run-btn" onclick="runAutoCheckinNow()" title="立即按顺序签到所有未签到账号，已签到账号自动跳过">{ic['play']}立即执行</button>
+    </div>
+  </div>
+  <dl class="schedule-status">
+    <div><dt>下次执行</dt><dd id="auto-checkin-next">-</dd></div>
+    <div><dt>上次执行</dt><dd id="auto-checkin-last">-</dd></div>
+    <div><dt>上次结果</dt><dd id="auto-checkin-result">-</dd></div>
+  </dl>
+  <div id="auto-checkin-msg" class="msg" role="status" aria-live="polite"></div>
+</section>
+</div>
+</div>
+</div>
+
+<div class="tab-page" data-page="usage">
+<div class="panel-grid">
+<div class="panel-card" id="usage-panel">
+  <div class="section-head"><div class="section-title">消费记录</div><span id="usage-updated" class="section-meta"></span></div>
+  <div id="usage-msg" class="msg" role="status" aria-live="polite"></div>
+  {usage_records_html}
+</div>
+</div>
+</div>
+
+<div class="tab-page" data-page="settings">
+<div class="panel-grid cols-2">
+<div class="panel-card">
+  <div class="section-head"><div class="section-title">多账号轮询</div></div>
+  <div class="switch-row">
+    <div class="switch-text"><strong>启用轮询</strong><span>每次请求自动切换到下一个有效账号</span></div>
+    <label class="switch" title="启用轮询">
+      <input type="checkbox" id="poll-toggle" {poll_checked} onchange="markPollingDirty()" aria-label="启用轮询"><span class="track"></span>
+    </label>
+  </div>
+  <div class="switch-row">
+    <div class="switch-text"><strong>轮询模式</strong></div>
+    <div class="segmented" role="radiogroup" aria-label="轮询模式">
+      <label><input type="radio" name="poll-mode" value="round-robin" onchange="markPollingDirty()" {poll_mode_rr}><span>顺序轮询</span></label>
+      <label><input type="radio" name="poll-mode" value="credit-priority" onchange="markPollingDirty()" {poll_mode_cp}><span>积分优先</span></label>
+    </div>
+  </div>
+  <p id="poll-status" class="field-note">当前账号数: {polling.get('account_count', 0)}，轮询: {'开' if polling.get('enabled') else '关'}</p>
+  <div class="btn-group">
+    <button class="btn btn-primary btn-sm" id="poll-save-btn" onclick="savePollingSettings()" disabled>{ic['save']}保存轮询设置</button>
+  </div>
+  <div id="poll-msg" class="msg" role="status" aria-live="polite"></div>
+</div>
+<div class="panel-card">
+  <div class="section-head"><div class="section-title">上游端点</div></div>
+  <div class="form-group">
+    <label for="settings-endpoint-preset">预设端点</label>
+    <select id="settings-endpoint-preset" onchange="applyEndpointPreset()">
+      {endpoint_options_html}
+    </select>
+  </div>
+  <div class="form-row">
+    <div class="form-group">
+      <label for="settings-web">自定义 Web Base URL</label>
+    <input id="settings-web" class="mono-input" value="{html_mod.escape(settings_web)}" placeholder="https://trae-api-cn.mchost.guru/api/remote/v1" oninput="markEndpointDirty()">
+    </div>
+  </div>
+  <div class="btn-group">
+    <button class="btn btn-primary btn-sm" id="settings-save-btn" onclick="saveSettings()" disabled>{ic['save']}保存设置</button>
+  </div>
+  <div id="settings-msg" class="msg"></div>
+</div>
+<div class="panel-card" id="relay-service-panel">
+  <div class="section-head"><div class="section-title">Relay 服务</div></div>
+  <div class="form-group">
+    <label for="settings-port">宿主机映射端口（RELAY_PORT）</label>
+      <input id="settings-port" type="number" value="{settings_port}" placeholder="8000" min="1" max="65535" oninput="markRelayServiceDirty()">
+  </div>
+  <p class="field-note">这是 Docker 对外发布的宿主机端口，容器内监听端口仍由 PORT 控制。修改后必须同步调整端口映射并重启，否则管理页面和 API 可能无法访问。</p>
+  <div class="btn-group">
+      <button class="btn btn-secondary btn-sm" id="relay-service-save-btn" onclick="saveRelayServiceSettings()" disabled>{ic['save']}保存服务设置</button>
+  </div>
+  <div id="relay-service-msg" class="msg"></div>
+</div>
+<div class="panel-card" id="auto-route-panel">
+  <div class="section-head">
+    <div class="section-title">自动路由</div>
+    <span id="auto-route-state" class="state-pill{auto_route_pill}">{auto_route_state_text}</span>
+  </div>
+  <div class="switch-row">
+    <div class="switch-text"><strong>启用自动路由</strong><span>工具调用走 IDE Agent，纯聊天走 Remote，失败回落 Remote；开启后忽略预设端点的模式</span></div>
+    <label class="switch" title="启用自动路由">
+      <input type="checkbox" id="auto-route-toggle" {auto_route_checked} onchange="markAutoRouteDirty()" aria-label="启用自动路由"><span class="track"></span>
+    </label>
+  </div>
+  <div class="btn-group">
+    <button class="btn btn-primary btn-sm" id="auto-route-save-btn" onclick="saveAutoRoute()" disabled>{ic['save']}保存自动路由</button>
+  </div>
+  <div id="auto-route-msg" class="msg" role="status" aria-live="polite"></div>
+</div>
+<div class="panel-card" id="max-mode-panel">
+  <div class="section-head">
+    <div class="section-title">1M 上下文（Max 模式）</div>
+    <span id="max-mode-state" class="state-pill{max_pill}">{max_state_text}</span>
+  </div>
+  <div class="switch-row">
+    <div class="switch-text"><strong>启用 Max 模式</strong><span>Remote Agent 会话使用 1M 上下文；带调用端工具的请求走 Work，不使用 Max</span></div>
+    <label class="switch" title="启用 Max 模式">
+      <input type="checkbox" id="max-mode-toggle" {max_checked} onchange="markMaxModeDirty()" aria-label="启用 Max 模式"><span class="track"></span>
+    </label>
+  </div>
+  <div class="form-group">
+    <label for="max-mode-models">生效模型（逗号分隔，留空表示账号中所有支持 Max 的模型）</label>
+    <input id="max-mode-models" value="{max_models}" placeholder="glm-5.3, deepseek-v4-pro" oninput="markMaxModeDirty()">
+  </div>
+  <div class="btn-group">
+    <button class="btn btn-primary btn-sm" id="max-mode-save-btn" onclick="saveMaxMode()" disabled>{ic['save']}保存</button>
+    <button class="btn btn-secondary btn-sm" id="max-mode-detect-btn" onclick="detectMaxModels()">{ic['search']}检测支持的模型</button>
+  </div>
+  <div id="max-mode-models-out" class="max-models" hidden></div>
+  <div id="max-mode-msg" class="msg" role="status" aria-live="polite"></div>
+</div>
+</div>
+</div>
+
+<div class="tab-page" data-page="models">
+<div class="panel-grid">
+<div class="panel-card" id="conn-panel">
+  <div class="section-head">
+    <div class="section-title">模型连通性测试</div>
+    <span id="conn-summary" class="section-meta">未运行</span>
+  </div>
+  <div class="form-row">
+    <div class="form-group">
+      <label for="conn-models">测试模型（逗号或换行分隔，留空使用常用模型）</label>
+      <textarea id="conn-models" rows="2" placeholder="glm-5.3, DeepSeek-V4-Pro-Official"></textarea>
+    </div>
+    <div class="form-group">
+      <label for="conn-endpoint">指定上游（测试期间禁止跨端点回落）</label>
+    <select id="conn-endpoint">
+        <option value="auto-route">自动路由（工具 IDE Agent / 聊天 Remote）</option>
+        <option value="remote">Remote / chat_sessions</option>
+        <option value="ide">IDE Agent / llm_utils_chat</option>
+        <option value="solo">Solo / api/agent/v3/llm_utils_chat</option>
+        <option value="work-agent">Work Agent / solo_work_remote</option>
+      </select>
+    </div>
+  </div>
+  <div class="form-group">
+    <span class="field-label">测试内容</span>
+    <div class="option-row">
+      <label class="inline-check"><input type="checkbox" id="conn-mode-text" checked> 文本回复</label>
+      <label class="inline-check"><input type="checkbox" id="conn-mode-tool"> 工具调用</label>
+      <label class="inline-check"><input type="checkbox" id="conn-thinking"> 返回思考内容</label>
+      <label class="inline-check" title="请求 1M Max 上下文，结果中显示是否实际生效"><input type="checkbox" id="conn-max"> 1M Max</label>
+      <label class="inline-check inline-field">思考强度
+        <select id="conn-effort" title="映射到 Trae custom_model.reasoning_effort：low=light，medium/high=high，xhigh=extra_high，超出模型支持的档位会向下取">
+          <option value="">默认</option>
+          <option value="low">low / 轻</option>
+          <option value="medium">medium / 高</option>
+          <option value="high">high / 高</option>
+          <option value="xhigh">xhigh / 极高</option>
+        </select>
+      </label>
+      <label class="inline-check inline-field">超时(秒) <input type="number" id="conn-timeout" value="120" min="10" max="600"></label>
+    </div>
+  </div>
+  <div class="btn-group">
+    <button class="btn btn-primary btn-sm" id="conn-run-btn" onclick="runConnTest()">{ic['play']}开始测试</button>
+    <button class="btn btn-secondary btn-sm" onclick="fillConnPreset()">{ic['list-plus']}填入常用模型</button>
+  </div>
+  <div class="conn-wrap" id="conn-table" hidden>
+    <table class="conn-table">
+      <thead><tr><th>模型</th><th>类型</th><th>结果</th><th>耗时</th><th>详情</th></tr></thead>
+      <tbody id="conn-tbody"></tbody>
+    </table>
+  </div>
+  <div id="conn-msg" class="msg"></div>
+</div>
+<div class="panel-card">
+  <div class="section-head">
+    <div class="section-title">模型列表</div>
+    <button class="btn btn-secondary btn-sm" onclick="refreshModels()">{ic['list']}获取模型列表</button>
+  </div>
+  <p class="section-desc">从当前账号的上游模型列表实时获取，只列小写模型名，大小写重复项已合并。</p>
+  <pre id="models-out" class="code-out"></pre>
+  <div id="models-msg" class="msg"></div>
+</div>
+</div>
+</div>
+
+</div>
+</main>
+</div>
+<script>
+function applyTheme(theme,persist){{
+  var t=theme==='dark'?'dark':'light';
+  document.documentElement.setAttribute('data-theme',t);
+  var cb=document.getElementById('theme-toggle');
+  if(cb) cb.checked=(t==='dark');
+  if(persist){{
+    try{{ localStorage.setItem('relay-theme',t); }}catch(e){{}}
+    var root=document.documentElement; root.classList.add('theme-anim');
+    clearTimeout(applyTheme.timer); applyTheme.timer=setTimeout(function(){{ root.classList.remove('theme-anim'); }},360);
+  }}
+}}
+applyTheme(document.documentElement.getAttribute('data-theme')||'light',false);
+function switchTab(name){{
+  document.querySelectorAll('.nav-item').forEach(function(b){{
+    var on=b.getAttribute('data-tab')===name;
+    b.classList.toggle('active',on);
+    b.setAttribute('aria-selected',on?'true':'false');
+    if(on){{ var t=document.getElementById('page-title'); if(t) t.textContent=b.getAttribute('data-title')||''; }}
+  }});
+  document.querySelectorAll('.tab-page').forEach(function(p){{ p.classList.toggle('active', p.getAttribute('data-page')===name); }});
+  try{{ history.replaceState(null,'','#'+name); }}catch(e){{}}
+  syncSelection();
+  if(name==='overview') refreshOverview();
+}}
+// Sliding highlights for the nav and segmented controls. The first placement
+// skips the transition so elements don't fly in from the corner.
+function placeSel(el,x,y,w,h){{
+  if(!w||!h) return;
+  var first=!el.dataset.placed;
+  if(first) el.classList.remove('ready');
+  el.style.width=w+'px'; el.style.height=h+'px';
+  el.style.transform='translate('+x+'px,'+y+'px)'; el.style.opacity='1';
+  if(first){{ el.dataset.placed='1'; void el.offsetWidth; el.classList.add('ready'); }}
+}}
+function syncSelection(){{
+  var nav=document.querySelector('.nav-list');
+  if(nav){{
+    var ind=nav.querySelector('.nav-indicator');
+    if(!ind){{ ind=document.createElement('span'); ind.className='nav-indicator'; ind.setAttribute('aria-hidden','true'); nav.insertBefore(ind,nav.firstChild); nav.classList.add('has-indicator'); }}
+    var a=nav.querySelector('.nav-item.active');
+    if(a) placeSel(ind,a.offsetLeft,a.offsetTop,a.offsetWidth,a.offsetHeight);
+  }}
+  document.querySelectorAll('.segmented').forEach(function(seg){{
+    var th=seg.querySelector('.seg-thumb');
+    if(!th){{
+      th=document.createElement('span'); th.className='seg-thumb'; th.setAttribute('aria-hidden','true');
+      seg.insertBefore(th,seg.firstChild); seg.classList.add('has-thumb');
+      seg.addEventListener('change',syncSelection);
+    }}
+    var c=seg.querySelector('input:checked');
+    var sp=c?c.nextElementSibling:null;
+    if(sp){{ var lab=sp.parentElement; placeSel(th,lab.offsetLeft+sp.offsetLeft,lab.offsetTop+sp.offsetTop,sp.offsetWidth,sp.offsetHeight); }}
+    else th.style.opacity='0';
+  }});
+}}
+function setStatePill(id,text,on){{
+  var el=document.getElementById(id);
+  if(!el) return;
+  el.textContent=text;
+  el.classList.toggle('on',!!on);
+}}
+// Overview numbers are derived from the rendered rows so every partial
+// refresh (single check-in, credits query, claim-all) keeps them in sync.
+function refreshStats(){{
+  var rows=Array.from(document.querySelectorAll('tr[data-account-id]'));
+  var checked=0, sum=0, known=false, unlimited=false;
+  rows.forEach(function(row){{
+    var st=row.querySelector('.checkin-state');
+    if(st&&st.textContent.trim()==='已签到') checked++;
+    var cv=row.querySelector('.credit-value');
+    var text=cv?cv.textContent:'';
+    if(text.indexOf('无限')>=0) unlimited=true;
+    var m=text.match(/剩(-?[0-9.]+)/);
+    if(m){{ sum+=Number(m[1]); known=true; }}
+  }});
+  var set=function(id,v){{ var el=document.getElementById(id); if(el) el.textContent=v; }};
+  set('stat-total',rows.length);
+  set('stat-checked',checked);
+  set('stat-credits',unlimited?'无限':(known?sum.toFixed(2):'-'));
+}}
+const state = {{ traceId: null, win: null }};
+let currentCodeVerifier = '';
+function uuid() {{ return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,function(c){{var r=Math.random()*16|0;return(c==='x'?r:(r&3|8)).toString(16)}}) }}
+function randomHex(n) {{ var a=new Uint8Array(n);crypto.getRandomValues(a);return Array.from(a,b=>b.toString(16).padStart(2,'0')).join('') }}
+function randomDigits(n) {{ var s='';while(s.length<n)s+=Math.floor(Math.random()*1e10).toString();return s.slice(0,n) }}
+function randomBase64Url(n) {{ var a=new Uint8Array(n); if(window.crypto&&crypto.getRandomValues){{ crypto.getRandomValues(a) }} else {{ for(var i=0;i<n;i++)a[i]=Math.floor(Math.random()*256) }} return btoa(String.fromCharCode.apply(null,a)).replace(/[+]/g,'-').split('/').join('_').replace(/=+$/,'') }}
+function buildChallenge() {{ currentCodeVerifier=randomBase64Url(32); return sha256Base64Url(currentCodeVerifier) }}
+async function buildAuthUrl() {{
+  // Trae 授权页强制要求回调为 http://127.0.0.1:<port>/authorize，
+  // 因此必须由本机 web_login.py 监听并转发凭据到服务器。
+  var cb = 'http://127.0.0.1:{listener_port}/authorize';
+  var mid = randomHex(32), did = randomDigits(19), tid = state.traceId;
+  var p = new URLSearchParams({{
+    login_version:'1',auth_from:'solo',login_channel:'native_ide',plugin_version:'2.3.24254',
+    auth_type:'local',client_id:'{html_mod.escape(client_id)}',redirect:'0',login_trace_id:tid,
+    auth_callback_url:cb,machine_id:mid,device_id:did,x_device_id:did,x_machine_id:mid,
+    x_device_brand:'ASUS TUF Gaming A15 FA507RM_FA507RM',x_device_type:'windows',x_os_version:'Windows 10 Pro',x_env:'',
+    x_app_version:'3.3.65',x_app_type:'stable',hide_saas_login:'true',
+  }});
+  return '{auth_url}?'+p.toString();
+}}
+async function checkLocalListener() {{
+  try {{
+    var ctrl = new AbortController();
+    var timer = setTimeout(function(){{ ctrl.abort(); }}, 1200);
+    var r = await fetch('http://127.0.0.1:{listener_port}/healthz', {{signal: ctrl.signal, cache: 'no-store'}});
+    clearTimeout(timer);
+    return r.ok;
+  }} catch(e) {{ return false; }}
+}}
+async function startAuth() {{
+  try {{
+  var ok = await checkLocalListener();
+  if (!ok) {{
+    showMsg('auth-msg', '未检测到本机授权助手，请先下载并双击运行 web_login.py（需 Python）或 start_auth.bat：', false);
+    document.getElementById('bat-link').style.display='inline-flex';
+    return;
+  }}
+  state.traceId = uuid();
+  var url = await buildAuthUrl();
+  var w = window.open(url, 'trae-relay-oauth', 'width=560,height=760');
+  if (!w) {{ showMsg('auth-msg','浏览器已拦截，请允许弹窗',false); return; }}
+  state.win = w;
+  document.getElementById('loading').style.display='block';
+  document.getElementById('auth-btn').disabled=true;
+  var poll = setInterval(function(){{ if(w.closed){{ clearInterval(poll);document.getElementById('loading').style.display='none';document.getElementById('auth-btn').disabled=false; }} }},700);
+  }} catch(e) {{ showMsg('auth-msg',String(e),false); document.getElementById('loading').style.display='none'; document.getElementById('auth-btn').disabled=false; }}
+}}
+
+let usageRefreshing = false;
+function usageRecordsFromPayload(payload){{
+  // Keep the console compatible with both the historical bare-array endpoint
+  // and deployments that wrap records in an object for metadata/versioning.
+  if(Array.isArray(payload)) return payload;
+  if(!payload || typeof payload!=='object') return null;
+  if(Array.isArray(payload.records)) return payload.records;
+  if(Array.isArray(payload.data)) return payload.data;
+  if(payload.data && typeof payload.data==='object' && Array.isArray(payload.data.records)) return payload.data.records;
+  return null;
+}}
+function usageRecordField(record, keys){{
+  if(!record || typeof record!=='object') return null;
+  for(var i=0;i<keys.length;i++){{
+    var value=record[keys[i]];
+    if(value!==undefined && value!==null && value!=='') return value;
+  }}
+  return null;
+}}
+function usageBoolean(value){{
+  if(value===true || value===1) return true;
+  if(value===false || value===0) return false;
+  if(typeof value==='string'){{
+    var text=value.trim().toLowerCase();
+    if(['true','1','yes','on','enabled','是','有'].indexOf(text)>=0) return true;
+    if(['false','0','no','off','disabled','否','无'].indexOf(text)>=0) return false;
+  }}
+  return null;
+}}
+function usageEffortLabel(value){{
+  if(value===undefined || value===null || value==='') return '';
+  var text=String(value).trim().toLowerCase().replace(/[\s-]+/g,'_');
+  if(text==='none' || text==='minimal' || text==='min') return '最低';
+  if(text==='low' || text==='light') return '低';
+  if(text==='medium' || text==='mid' || text==='normal' || text==='default') return '中';
+  if(text==='high') return '高';
+  if(text==='xhigh' || text==='extra_high' || text==='very_high' || text==='max' || text==='maximum') return '极高';
+  return escapeHtml(String(value));
+}}
+function usageReasoningMeta(record){{
+  var requested=usageRecordField(record,[
+    'requested_reasoning_effort','reasoning_effort_requested','thinking_effort',
+    'thinking_level','reasoning_effort'
+  ]);
+  var thinking=record && record.thinking;
+  if(requested===null && thinking && typeof thinking==='object'){{
+    requested=thinking.effort || thinking.level || thinking.budget_tokens || thinking.budgetTokens || null;
+  }}
+  var applied=usageRecordField(record,[
+    'reasoning_effort_applied','applied_reasoning_effort','native_reasoning_effort'
+  ]);
+  var requestedLabel=usageEffortLabel(requested);
+  var appliedLabel=usageEffortLabel(applied);
+  if(requestedLabel && appliedLabel && requestedLabel!==appliedLabel){{
+    return {{
+      text: requestedLabel+'<span class="usage-arrow">→</span>'+appliedLabel,
+      title: '请求: '+String(requested)+'；生效: '+String(applied),
+      unknown: false
+    }};
+  }}
+  var label=appliedLabel || requestedLabel;
+  return {{
+    text: label || '--',
+    title: label ? '思考强度: '+String(applied || requested) : '未记录思考强度',
+    unknown: !label
+  }};
+}}
+function usageContextMeta(record){{
+  var requested=usageRecordField(record,['context_mode_requested','requested_context_mode']);
+  var value=usageRecordField(record,['context_mode_actual','actual_context_mode','context_mode','contextMode','context_window_mode']);
+  var raw=value;
+  var boolMax=usageBoolean(usageRecordField(record,['max_mode_applied','max_mode']));
+  var size=Number(usageRecordField(record,['context_window_tokens','max_context_tokens','prompt_max_tokens']) || 0);
+  if(value===null && boolMax===true) value='max';
+  if(value===null && size>=1000000) value='1m';
+  if(value===null && boolMax===false) value='standard';
+  // Older rows often persisted only the requested context.  Treat an
+  // explicit standard request as the visible context label while preserving
+  // the separate Max column for actual activation evidence.
+  if(value===null && requested!==null) value=requested;
+  if(value===null) return {{text:'--',title:'未记录上下文模式'+(requested!==null?'；请求: '+String(requested):''),unknown:true}};
+  var text=String(value).trim().toLowerCase().replace(/[\s_-]+/g,'');
+  var label;
+  if(['max','max1m','1m','1000000','agent','agentmax','maxmode'].indexOf(text)>=0 || size>=1000000) label='1M Max';
+  else if(['standard','default','work','dev','200k','200000','normal'].indexOf(text)>=0) label='标准';
+  else label=String(raw===null?value:raw);
+  var requestedText='';
+  if(requested!==null && String(requested)!==String(value)){{
+    requestedText='请求: '+String(requested)+'；';
+  }}
+  return {{text:label,title:requestedText+'实际上下文模式: '+String(value)+(size?'；窗口: '+size.toLocaleString()+' tokens':''),unknown:false}};
+}}
+function usageMaxMeta(record){{
+  var requested=usageBoolean(usageRecordField(record,['max_mode_requested','requested_max_mode']));
+  var enabled=usageBoolean(usageRecordField(record,['max_mode_enabled','max_mode_applied','max_mode']));
+  if(requested===null){{
+    var requestedContext=usageRecordField(record,['context_mode_requested','requested_context_mode']);
+    if(requestedContext!==null){{
+      var normalized=String(requestedContext).trim().toLowerCase().replace(/[\s_-]+/g,'');
+      requested=['max','max1m','1m','1000000','agentmax','maxmode'].indexOf(normalized)>=0;
+    }}
+  }}
+  if(enabled===null){{
+    var actualContext=usageRecordField(record,['context_mode_actual','actual_context_mode','context_mode']);
+    if(actualContext!==null){{
+      var actual=String(actualContext).trim().toLowerCase().replace(/[\s_-]+/g,'');
+      enabled=['max','max1m','1m','1000000','agentmax','maxmode'].indexOf(actual)>=0;
+    }}
+  }}
+  if(enabled===null && requested===false) enabled=false;
+  if(enabled===true) return {{text:'已开启',title:'本次请求实际启用 1M Max',unknown:false,requested:requested,enabled:true}};
+  if(enabled===false && requested===true) return {{text:'未生效',title:'请求开启 Max，但上游本次未实际启用',unknown:false,requested:requested,enabled:false}};
+  if(enabled===false) return {{text:'未开启',title:'本次请求未启用 1M Max',unknown:false,requested:requested,enabled:false}};
+  if(requested===true) return {{text:'请求 / 未知',title:'请求开启 Max，但没有上游实际生效证据',unknown:true,requested:requested,enabled:null}};
+  return {{text:'--',title:'未记录 Max 模式',unknown:true,requested:requested,enabled:enabled}};
+}}
+function usageToolMeta(record){{
+  var requested=usageBoolean(usageRecordField(record,['tools_requested','tool_protocol_requested']));
+  var used=usageBoolean(usageRecordField(record,['tool_called','tool_used','tool_calls_returned','tool_call_returned','tool']));
+  if(requested===null && used===true) requested=true;
+  if(requested===null && record && Array.isArray(record.tools)) requested=record.tools.length>0;
+  if(requested===null && record && record.tools!==undefined) requested=!!record.tools;
+  if(requested===null && record && record.tool_choice!==undefined && record.tool_choice!=='none') requested=true;
+  var state=requested;
+  if(state===null) return {{text:'--',title:'未记录是否携带 tools 参数',unknown:true,requested:null,called:used}};
+  var title=state?'请求携带 tools 参数':'请求未携带 tools 参数';
+  if(used===true) title+='；模型返回了工具调用';
+  else if(used===false) title+='；模型未返回工具调用';
+  var text=state?'已携带':'未携带';
+  if(state && used===true) text+=' / 本轮调用';
+  else if(state && used===false) text+=' / 未调用';
+  return {{text:text,title:title,unknown:false,requested:state,called:used}};
+}}
+function usageModelFlags(maxMode,tool){{
+  var maxText=maxMode.enabled===true?'1M':(maxMode.enabled===false?'标准':(maxMode.requested===true?'请求':'--'));
+  var maxClass=maxMode.enabled===true?' max':(maxMode.unknown?' unknown':'');
+  var toolText=tool.requested===true?'是':(tool.requested===false?'否':'--');
+  var toolClass=tool.requested===true?' tool':(tool.unknown?' unknown':'');
+  return '<span class="usage-flag'+maxClass+'" title="'+escapeHtml(maxMode.title)+'">Max: '+maxText+'</span>'
+    + '<span class="usage-flag'+toolClass+'" title="'+escapeHtml(tool.title)+'">Tool: '+toolText+'</span>';
+}}
+async function refreshUsage() {{
+  if(usageRefreshing) return;
+  usageRefreshing=true;
+  var tbody=document.getElementById('usage-records-body');
+  var empty=document.getElementById('usage-empty');
+  var msg=document.getElementById('usage-msg');
+  try {{
+    var result=await requestJSON('/api/usage/records',{{method:'GET'}},15000);
+    if(!result.ok) throw new Error(apiError(result.data,result.status));
+    var records=usageRecordsFromPayload(result.data);
+    if(records===null) throw new Error(apiError(result.data,result.status));
+    if(!tbody) return;
+    if(records.length===0) {{
+      tbody.innerHTML='';
+      if(empty) empty.style.display='block';
+    }} else {{
+      if(empty) empty.style.display='none';
+      tbody.innerHTML=records.map(function(record) {{
+        var stamp=Number(record.timestamp||0);
+        var when=stamp?new Date(stamp*1000).toLocaleString():'--';
+        var account=record.account_id?String(record.account_id).slice(-12):'--';
+        var model=record.model||'--';
+         var reasoning=usageReasoningMeta(record);
+         var context=usageContextMeta(record);
+         var maxMode=usageMaxMeta(record);
+         var tool=usageToolMeta(record);
+        var input=Number(record.input_tokens!==undefined?record.input_tokens:(record.prompt_tokens||0));
+        var output=Number(record.output_tokens!==undefined?record.output_tokens:(record.completion_tokens||0));
+        var total=Number(record.total_tokens!==undefined?record.total_tokens:(input+output));
+        var tokenText=record.tokens_source==='unknown'?'--':(input+' / '+output+' / '+total);
+        var source=record.credits_source||'unknown';
+        var credits=record.credits_consumed;
+        var creditText=credits===null||credits===undefined
+          ?(source==='pending'?'结算中':'--')
+          :Number(credits).toFixed(2);
+        var status=record.status||'completed';
+        var statusText=status==='completed'?'完成':(status==='cancelled'?'已取消':(status==='error'?'失败':status));
+        var badge=status==='completed'?'badge-ok':(status==='error'?'badge-expired':'badge-none');
+        return '<tr>'
+          + '<td>'+escapeHtml(when)+'</td>'
+          + '<td><code>'+escapeHtml(account)+'</code></td>'
+          + '<td class="usage-model-cell"><div title="'+escapeHtml(model)+'">'+escapeHtml(model)+'</div><div class="usage-model-flags">'+usageModelFlags(maxMode,tool)+'</div></td>'
+          + '<td class="usage-meta'+(reasoning.unknown?' unknown':'')+'" title="'+escapeHtml(reasoning.title)+'">'+reasoning.text+'</td>'
+          + '<td class="usage-meta'+(context.unknown?' unknown':'')+'" title="'+escapeHtml(context.title)+'">'+escapeHtml(context.text)+'</td>'
+          + '<td class="usage-meta'+(maxMode.unknown?' unknown':'')+'" title="'+escapeHtml(maxMode.title)+'">'+escapeHtml(maxMode.text)+'</td>'
+          + '<td class="usage-meta usage-tool'+(tool.unknown?' unknown':'')+'" title="'+escapeHtml(tool.title)+'">'+escapeHtml(tool.text)+'</td>'
+          + '<td class="numeric">'+escapeHtml(tokenText)+'</td>'
+          + '<td class="numeric" title="'+escapeHtml(source)+'">'+escapeHtml(creditText)+'</td>'
+          + '<td class="usage-status"><span class="badge '+badge+'">'+escapeHtml(statusText)+'</span></td>'
+          + '</tr>';
+      }}).join('');
+    }}
+    var updated=document.getElementById('usage-updated');
+    if(updated) updated.textContent='更新于 '+new Date().toLocaleTimeString()+' · '+records.length+' 条';
+    if(msg){{ msg.textContent=''; msg.className='msg'; }}
+  }} catch(e) {{
+    if(msg){{ msg.textContent=String(e); msg.className='msg msg-err'; }}
+  }} finally {{ usageRefreshing=false; }}
+}}
+setInterval(refreshUsage, 5000);
+refreshUsage();
+// Overview dashboard. Data comes from /api/overview (persistent daily
+// buckets); the chart reuses its bar nodes so refreshes animate heights.
+var ovData=null, ovRange=14, ovDay='', ovLoading=false;
+function fmtInt(n){{ return Number(n||0).toLocaleString('en-US'); }}
+function fmtCompact(n){{
+  n=Number(n||0); var a=Math.abs(n);
+  if(a>=1e9) return (n/1e9).toFixed(2)+'B';
+  if(a>=1e6) return (n/1e6).toFixed(2)+'M';
+  if(a>=1e4) return (n/1e3).toFixed(1)+'K';
+  return fmtInt(n);
+}}
+function fmtPct(part,whole){{ return whole?(part/whole*100).toFixed(1)+'%':'--'; }}
+function fmtUptime(s){{
+  s=Math.max(0,Math.floor(s||0));
+  var d=Math.floor(s/86400), h=Math.floor(s%86400/3600), m=Math.floor(s%3600/60);
+  return d?(d+' 天 '+h+' 小时'):(h?(h+' 小时 '+m+' 分'):(m+' 分'));
+}}
+function setOv(id,value,title){{
+  var el=document.getElementById(id); if(!el) return;
+  el.textContent=value;
+  if(title!==undefined) el.title=title;
+}}
+function setOvPill(id,on,label){{
+  var el=document.getElementById(id); if(!el) return;
+  el.innerHTML='<span class="state-pill'+(on?' on':'')+'">'+escapeHtml(label)+'</span>';
+}}
+function niceCeil(v){{
+  if(v<=0) return 1;
+  var p=Math.pow(10,Math.floor(Math.log10(v))), f=v/p;
+  return (f<=1?1:f<=2?2:f<=5?5:10)*p;
+}}
+function ovRows(){{ return ovData?ovData.usage.daily.slice(0,ovRange).reverse():[]; }}
+function ovFind(day){{
+  if(!ovData) return null;
+  var rows=ovData.usage.daily;
+  for(var i=0;i<rows.length;i++){{ if(rows[i].date===day) return rows[i]; }}
+  return null;
+}}
+async function refreshOverview(){{
+  if(ovLoading) return;
+  ovLoading=true;
+  var msg=document.getElementById('ov-msg');
+  try{{
+    var r=await requestJSON('/api/overview?days=30',{{method:'GET'}},15000);
+    if(!r.ok||!r.data||!r.data.success) throw new Error(apiError(r.data,r.status));
+    ovData=r.data;
+    renderOverview();
+    setOv('ov-updated','更新于 '+new Date().toLocaleTimeString());
+    if(msg){{ msg.textContent=''; msg.className='msg'; }}
+  }}catch(e){{
+    if(msg){{ msg.textContent=String(e&&e.message||e); msg.className='msg msg-err'; }}
+  }}finally{{ ovLoading=false; }}
+}}
+function renderOverview(){{
+  if(!ovData) return;
+  var u=ovData.usage, t=u.totals, td=u.today, a=ovData.accounts, s=ovData.service;
+  setOv('ov-total',fmtCompact(t.total_tokens),fmtInt(t.total_tokens));
+  setOv('ov-total-sub',u.first_day?(fmtInt(t.requests)+' 次请求 · 自 '+u.first_day):'暂无记录');
+  setOv('ov-input',fmtCompact(t.input_tokens),fmtInt(t.input_tokens));
+  setOv('ov-input-sub','占总量 '+fmtPct(t.input_tokens,t.total_tokens));
+  setOv('ov-output',fmtCompact(t.output_tokens),fmtInt(t.output_tokens));
+  setOv('ov-output-sub','占总量 '+fmtPct(t.output_tokens,t.total_tokens));
+  setOv('ov-cache',fmtCompact(t.cached_tokens),fmtInt(t.cached_tokens));
+  setOv('ov-cache-sub','输入命中率 '+fmtPct(t.cached_tokens,t.input_tokens));
+  setOv('ov-today',fmtCompact(td.total_tokens),fmtInt(td.total_tokens));
+  setOv('ov-today-sub',fmtInt(td.requests)+' 次请求'+(td.failed?' · '+td.failed+' 失败':''));
+  setOv('ov-accounts',a.valid+' / '+a.total);
+  setOv('ov-accounts-sub','今日签到 '+a.checked_in+' / '+a.total);
+  setOvPill('ov-token',s.token_ok,s.token_ok?'有效':'失效');
+  setOv('ov-version','v'+s.version);
+  setOv('ov-uptime',fmtUptime(s.uptime_seconds));
+  setOv('ov-upstream',s.auto_route?'自动路由':s.upstream_mode);
+  setOvPill('ov-polling',s.polling,s.polling?(s.polling_mode==='credit-priority'?'积分优先':'顺序轮询'):'关');
+  setOvPill('ov-max',s.max_mode,s.max_mode?'开':'关');
+  var ac=s.auto_checkin||{{}};
+  setOvPill('ov-autocheckin',ac.enabled,ac.enabled?('每日 '+(ac.time||'')):'关');
+  setOv('ov-inflight',String(s.in_flight||0));
+  var cr=a.credits_remaining;
+  setOv('ov-credits',cr==='unlimited'?'无限':(cr===null||cr===undefined?'--':Number(cr).toFixed(2)));
+  renderOverviewChart();
+  renderOverviewDays();
+  showOverviewDay(ovDay);
+}}
+function renderOverviewChart(){{
+  var chart=document.getElementById('ov-chart'), axis=document.getElementById('ov-axis');
+  if(!chart||!axis) return;
+  var rows=ovRows(), max=0;
+  rows.forEach(function(r){{ max=Math.max(max,(r.input_tokens||0)+(r.output_tokens||0)); }});
+  var scale=niceCeil(max);
+  setOv('ov-y-max',max?fmtCompact(scale):'0');
+  setOv('ov-y-mid',max?fmtCompact(scale/2):'0');
+  var rebuild=chart.children.length!==rows.length;
+  if(rebuild){{
+    chart.innerHTML=rows.map(function(){{
+      return '<div class="bar-col" tabindex="0" role="button"><div class="bar-stack">'
+        +'<span class="bar-seg seg-out"></span><span class="bar-seg seg-in"></span><span class="bar-seg seg-cache"></span>'
+        +'</div></div>';
+    }}).join('');
+    var step=Math.ceil(rows.length/8);
+    axis.innerHTML=rows.map(function(r,i){{
+      var show=(rows.length-1-i)%step===0;
+      return '<span>'+(show?escapeHtml(r.date.slice(5)):'')+'</span>';
+    }}).join('');
+  }}
+  function apply(){{
+    rows.forEach(function(r,i){{
+      var col=chart.children[i]; if(!col) return;
+      var cache=Math.min(r.cached_tokens||0,r.input_tokens||0);
+      var segs=col.firstChild.children;
+      segs[0].style.height=((r.output_tokens||0)/scale*100)+'%';
+      segs[1].style.height=(((r.input_tokens||0)-cache)/scale*100)+'%';
+      segs[2].style.height=(cache/scale*100)+'%';
+      col.setAttribute('data-day',r.date);
+      col.setAttribute('aria-label',r.date+' 总计 '+fmtInt(r.total_tokens)+' Token');
+      col.classList.toggle('sel',r.date===ovDay);
+    }});
+  }}
+  // Fresh bars start at zero height and grow on the next frame.
+  if(rebuild) requestAnimationFrame(function(){{ requestAnimationFrame(apply); }}); else apply();
+}}
+function renderOverviewDays(){{
+  var body=document.getElementById('ov-days-body'), foot=document.getElementById('ov-days-foot');
+  if(!body||!foot||!ovData) return;
+  var hide=document.getElementById('ov-hide-empty');
+  var today=ovData.usage.today.date;
+  var rows=ovData.usage.daily.slice(0,ovRange);
+  var sum={{requests:0,failed:0,input_tokens:0,output_tokens:0,cached_tokens:0,total_tokens:0,max_mode_requests:0,max_mode_enabled_requests:0,tool_requests:0,tool_calls:0,credits:0}};
+  rows.forEach(function(r){{ for(var k in sum) sum[k]+=Number(r[k]||0); }});
+  var shown=rows.filter(function(r){{ return !(hide&&hide.checked&&!r.requests); }});
+  body.innerHTML=shown.length?shown.map(function(r){{
+    var cls=(r.requests?'':'zero')+(r.date===ovDay?' sel':'');
+    var top=(r.models||[]).slice(0,3).map(function(m){{ return m.model+' '+fmtInt(m.total_tokens); }}).join('，');
+    return '<tr class="'+cls+'" data-day="'+escapeHtml(r.date)+'" title="'+escapeHtml(top)+'">'
+      +'<td>'+escapeHtml(r.date)+(r.date===today?'<span class="badge badge-active">今日</span>':'')+'</td>'
+      +'<td>'+fmtInt(r.requests)+'</td>'
+      +'<td>'+fmtInt(r.failed)+'</td>'
+      +'<td>'+fmtInt(r.input_tokens)+'</td>'
+      +'<td>'+fmtInt(r.output_tokens)+'</td>'
+      +'<td>'+fmtInt(r.cached_tokens)+'</td>'
+      +'<td>'+fmtInt(r.total_tokens)+'</td>'
+      +'<td>'+fmtInt(r.max_mode_requests||0)+' / '+fmtInt(r.max_mode_enabled_requests||0)+'</td>'
+      +'<td>'+fmtInt(r.tool_requests||0)+' / '+fmtInt(r.tool_calls||0)+'</td>'
+      +'<td>'+Number(r.credits||0).toFixed(2)+'</td>'
+      +'</tr>';
+  }}).join(''):'<tr class="zero"><td colspan="10">所选范围内没有请求</td></tr>';
+  foot.innerHTML='<td>合计 '+ovRange+' 天</td>'
+    +'<td>'+fmtInt(sum.requests)+'</td><td>'+fmtInt(sum.failed)+'</td>'
+    +'<td>'+fmtInt(sum.input_tokens)+'</td><td>'+fmtInt(sum.output_tokens)+'</td>'
+    +'<td>'+fmtInt(sum.cached_tokens)+'</td><td>'+fmtInt(sum.total_tokens)+'</td>'
+    +'<td>'+fmtInt(sum.max_mode_requests)+' / '+fmtInt(sum.max_mode_enabled_requests)+'</td>'
+    +'<td>'+fmtInt(sum.tool_requests)+' / '+fmtInt(sum.tool_calls)+'</td>'
+    +'<td>'+sum.credits.toFixed(2)+'</td>';
+  var active=rows.filter(function(r){{ return r.requests; }}).length;
+  setOv('ov-days-meta',active+' / '+ovRange+' 天有请求');
+}}
+function showOverviewDay(day){{
+  var box=document.getElementById('ov-readout');
+  if(!box||!ovData) return;
+  var r=ovFind(day)||ovData.usage.today;
+  var label=r.date===ovData.usage.today.date?r.date+' 今日':r.date;
+  function item(sw,name,value){{
+    return '<span class="readout-item">'+(sw?'<span class="swatch '+sw+'"></span>':'')+name+' <strong>'+value+'</strong></span>';
+  }}
+  box.innerHTML='<span class="readout-date">'+escapeHtml(label)+'</span>'
+    +item('sw-in','输入',fmtInt(r.input_tokens))
+    +item('sw-cache','缓存',fmtInt(r.cached_tokens))
+    +item('sw-out','输出',fmtInt(r.output_tokens))
+    +item('','总计',fmtInt(r.total_tokens))
+    +item('','请求',fmtInt(r.requests));
+}}
+function selectOverviewDay(day){{
+  ovDay=day||'';
+  document.querySelectorAll('#ov-chart .bar-col').forEach(function(c){{ c.classList.toggle('sel',c.getAttribute('data-day')===ovDay); }});
+  document.querySelectorAll('#ov-days-body tr[data-day]').forEach(function(tr){{
+    var on=tr.getAttribute('data-day')===ovDay;
+    tr.classList.toggle('sel',on);
+    if(on&&tr.scrollIntoView) tr.scrollIntoView({{block:'nearest'}});
+  }});
+  showOverviewDay(ovDay);
+}}
+function setOverviewRange(value){{
+  ovRange=Number(value)||14;
+  renderOverviewChart();
+  renderOverviewDays();
+}}
+(function(){{
+  var chart=document.getElementById('ov-chart');
+  if(chart){{
+    var pick=function(e){{ var c=e.target.closest&&e.target.closest('.bar-col'); return c?c.getAttribute('data-day'):null; }};
+    chart.addEventListener('mouseover',function(e){{ var d=pick(e); if(d) showOverviewDay(d); }});
+    chart.addEventListener('focusin',function(e){{ var d=pick(e); if(d) showOverviewDay(d); }});
+    chart.addEventListener('mouseleave',function(){{ showOverviewDay(ovDay); }});
+    chart.addEventListener('click',function(e){{ var d=pick(e); if(d) selectOverviewDay(d); }});
+    chart.addEventListener('keydown',function(e){{
+      if(e.key!=='Enter'&&e.key!==' ') return;
+      var d=pick(e); if(d){{ e.preventDefault(); selectOverviewDay(d); }}
+    }});
+  }}
+  var body=document.getElementById('ov-days-body');
+  if(body) body.addEventListener('click',function(e){{
+    var tr=e.target.closest&&e.target.closest('tr[data-day]');
+    if(tr) selectOverviewDay(tr.getAttribute('data-day'));
+  }});
+}})();
+setInterval(function(){{
+  if(document.hidden) return;
+  if(document.querySelector('.tab-page.active[data-page="overview"]')) refreshOverview();
+}},10000);
+refreshOverview();
+window.addEventListener('message',function(ev){{
+  if (!ev.data||ev.data.type!=='trae-relay-web-login') return;
+  if (state.traceId&&ev.data.loginTraceId!==state.traceId) return;
+  if (ev.data.success) {{ showMsg('auth-msg','授权成功，凭证已写入服务器',true); setTimeout(function(){{ location.reload(); }},800); }}
+  else {{ showMsg('auth-msg',ev.data.error||'授权失败',false); }}
+  document.getElementById('loading').style.display='none';
+  document.getElementById('auth-btn').disabled=false;
+  if (state.win&&!state.win.closed) state.win.close();
+}});
+let messageTimers = {{}};
+let toastTimer = null;
+function showToast(title,text,ok,timeout){{
+  var toast=document.getElementById('toast');
+  var titleEl=document.getElementById('toast-title');
+  var textEl=document.getElementById('toast-text');
+  if(!toast) return;
+  clearTimeout(toastTimer);
+  titleEl.textContent=title||'';
+  textEl.textContent=text||'';
+  toast.className='toast visible '+(ok?'ok':'error');
+  var delay=timeout===undefined?(ok?3000:9000):timeout;
+  if(delay>0) toastTimer=setTimeout(function(){{ toast.className='toast'; }},delay);
+}}
+function showMsg(id,text,ok,timeout){{
+  var el=document.getElementById(id);
+  if(!el) return;
+  clearTimeout(messageTimers[id]);
+  if(!text){{ el.textContent=''; el.className='msg'; return; }}
+  el.textContent=text;
+  el.className='msg '+(ok?'msg-ok':'msg-err');
+  var delay=timeout===undefined?(ok?3000:9000):timeout;
+  if(delay>0) messageTimers[id]=setTimeout(function(){{ el.textContent=''; el.className='msg'; }},delay);
+  showToast(ok?'成功':'操作失败',text,ok,delay);
+}}
+function endpointDiagnosticText(data){{
+  if(!data||(!data.fallback_used&&!data.fallback_reason&&!data.failed_endpoint)) return '';
+  var requested=String(data.requested_endpoint||data.requested_mode||'').trim();
+  var actual=String(data.actual_endpoint||data.actual_mode||'').trim();
+  var target=String(data.fallback_target||actual||'').trim();
+  var failed=String(data.failed_endpoint||requested||'').trim();
+  var reason=String(data.fallback_reason||'').trim();
+  var parts=[];
+  if(failed) parts.push('失败端点='+failed);
+  if(target) parts.push('回落目标='+target);
+  if(reason) parts.push('原因='+reason);
+  return parts.join(' | ');
+}}
+function showEndpointDiagnostic(data,title){{
+  var text=endpointDiagnosticText(data);
+  if(!text) return '';
+  showToast(
+    title||'端点诊断',
+    text,
+    !data.fallback_used&&!data.fallback_reason,
+    9000
+  );
+  return text;
+}}
+function escapeHtml(value){{
+  return String(value===undefined||value===null?'':value).replace(/[&<>"']/g,function(ch){{ return {{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[ch]; }});
+}}
+function responseCode(data){{
+  if(!data) return '';
+  var body=data.data||data;
+  return body && body.code!==undefined && body.code!==null ? String(body.code) : '';
+}}
+function apiError(data,status){{
+  var code=responseCode(data);
+  var message=(data&&data.error)||(data&&data.message)||(data&&data.data&&(data.data.message||data.data.error))||('HTTP '+(status||'未知'));
+  var prefix=status&&status!==200?'HTTP '+status:'';
+  if(code) prefix+=(prefix?'，':'')+'业务码 '+code;
+  return (prefix?prefix+'：':'')+String(message);
+}}
+async function requestJSON(url,options,timeoutMs){{
+  var controller=new AbortController();
+  var timeout=setTimeout(function(){{ controller.abort(); }},timeoutMs||45000);
+  var requestOptions=Object.assign({{cache:'no-store'}},options||{{}},{{signal:controller.signal}});
+  try{{
+    var response=await fetch(url,requestOptions);
+    var text=await response.text();
+    var data={{}};
+    if(text){{
+      try{{ data=JSON.parse(text); }}catch(e){{ data={{error:'服务返回了无效 JSON'}}; }}
+    }}
+    return {{ok:response.ok,status:response.status,data:data}};
+  }}catch(e){{
+    if(e&&e.name==='AbortError') throw new Error('请求超时，请检查上游连接后重试');
+    throw new Error('网络请求失败：'+String(e));
+  }}finally{{ clearTimeout(timeout); }}
+}}
+async function postJSON(url,payload,timeoutMs){{
+  try{{
+    var result=await requestJSON(url,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload||{{}})}},timeoutMs||45000);
+    var d=result.data;
+    if(!d||typeof d!=='object'||Array.isArray(d)) d={{}};
+    d._http_status=result.status; d._http_ok=result.ok;
+    return d;
+  }}catch(e){{ return {{success:false,error:String(e),_http_status:0,_http_ok:false}}; }}
+}}
+let checkinGlobalBusy=false;
+let checkinAccountBusy=new Set();
+function syncCheckinBusyUI(){{
+  var anyBusy=checkinGlobalBusy||checkinAccountBusy.size>0;
+  ['checkin-status-refresh-btn','credits-refresh-btn','checkin-claim-btn'].forEach(function(id){{
+    var el=document.getElementById(id); if(el){{ el.disabled=anyBusy; el.classList.toggle('busy',anyBusy); }}
+  }});
+  document.querySelectorAll('[data-action="checkin"]').forEach(function(el){{
+    var row=el.closest('tr[data-account-id]');
+    var id=row&&row.getAttribute('data-account-id');
+    var busy=checkinGlobalBusy||checkinAccountBusy.has(String(id||''));
+    el.disabled=busy;
+    el.classList.toggle('busy',busy);
+  }});
+  var indicator=document.getElementById('checkin-busy');
+  if(indicator){{ indicator.classList.toggle('visible',anyBusy); indicator.textContent=anyBusy?'正在查询/签到...':''; }}
+}}
+function setBusy(busy){{
+  checkinGlobalBusy=!!busy;
+  syncCheckinBusyUI();
+}}
+function setAccountCheckinBusy(id,busy){{
+  id=String(id);
+  if(busy) checkinAccountBusy.add(id); else checkinAccountBusy.delete(id);
+  var row=document.getElementById('row-'+id);
+  if(row) row.classList.toggle('checkin-row-busy',busy);
+  var detail=document.getElementById('checkin-detail-'+id);
+  if(detail&&busy){{ detail.textContent='正在签到该账号...'; detail.style.color=''; }}
+  syncCheckinBusyUI();
+}}
+function setCredits(id,data){{
+  var values=[['general-credits-',data&&data.account_credits]];
+  values.forEach(function(pair){{
+    var el=document.getElementById(pair[0]+id), value=pair[1];
+    if(!el) return;
+    if(value===undefined||value===null) return;
+    if(value.unlimited) el.textContent='☆ 无限';
+    else if(value.remaining!==undefined&&value.remaining!==null) el.textContent='剩'+Number(value.remaining).toFixed(2)+'/总'+(value.total_limit===undefined?'?':Number(value.total_limit).toFixed(2));
+    else el.textContent='-';
+  }});
+}}
+function setCheckinState(id,checked,detail,error){{
+  var el=document.getElementById('checkin-'+id), detailEl=document.getElementById('checkin-detail-'+id);
+  if(el){{
+    var badge=checked===true?'<span class="badge badge-ok">已签到</span>':(checked===false?'<span class="badge badge-active">未签到</span>':'<span class="badge badge-none">未知</span>');
+    el.innerHTML=badge;
+  }}
+  if(detailEl){{ detailEl.textContent=error||detail||''; detailEl.style.color=error?'var(--danger)':''; }}
+}}
+function updateAccountRow(account){{
+  if(!account||!account.id) return;
+  updateAccountCreditsRow(account);
+  updateAccountCheckinRow(account);
+}}
+function updateAccountCreditsRow(account){{
+  if(!account||!account.id) return;
+  setCredits(account.id,account);
+  refreshStats();
+}}
+function updateAccountCheckinRow(account){{
+  if(!account||!account.id) return;
+  var payload=account.data||account.checkin||{{}};
+  var code=payload&&payload.code!==undefined?'业务码 '+payload.code:'';
+  var detail=account.error||code||'';
+  setCheckinState(account.id,account.checked_in,detail,account.error);
+  var labelEl=document.getElementById('label-'+account.id);
+  if(labelEl&&account.label) labelEl.textContent=account.label;
+  var row=document.getElementById('row-'+account.id);
+  if(row) row.classList.toggle('row-failed',!!account.error||account.success===false);
+  refreshStats();
+}}
+function setActiveAccount(id,account){{
+  document.querySelectorAll('tr[data-account-id]').forEach(function(row){{
+    var active=row.getAttribute('data-account-id')===String(id);
+    row.classList.toggle('active-row',active);
+    var badge=row.querySelector('[data-account-active]');
+    if(badge) badge.hidden=!active;
+    var button=row.querySelector('[data-action="switch-account"]');
+    if(button) button.disabled=active;
+  }});
+  var user=document.getElementById('active-user-id');
+  if(user){{
+    var userId=account&&(account.user_id||account.id)||id||'';
+    user.textContent=userId?'用户: '+userId:'';
+    user.hidden=!userId;
+  }}
+}}
+function setSwitchBusy(busy){{
+  document.querySelectorAll('[data-action="switch-account"]').forEach(function(button){{
+    if(busy){{ button.disabled=true; }}
+    else {{
+      var row=button.closest('tr[data-account-id]');
+      button.disabled=!!(row&&row.classList.contains('active-row'));
+    }}
+  }});
+}}
+function updateCheckinSummary(accounts,action){{
+  var list=Array.isArray(accounts)?accounts:[];
+  var ok=list.filter(function(a){{ return a.checked_in===true; }}).length;
+  var failed=list.filter(function(a){{ return !!a.error||a.success===false; }}).length;
+  var summary=document.getElementById('checkin-summary');
+  if(summary) summary.textContent=(action||'已更新')+'：'+ok+' 已签到 / '+list.length+' 个账号'+(failed?'，'+failed+' 个异常':'');
+  var updated=document.getElementById('checkin-updated');
+  if(updated) updated.textContent='更新于 '+new Date().toLocaleTimeString();
+  return {{ok:ok,failed:failed,total:list.length}};
+}}
+function updateVisibleCheckinSummary(action){{
+  var rows=Array.from(document.querySelectorAll('tr[data-account-id]'));
+  var ok=rows.filter(function(row){{
+    var state=row.querySelector('.checkin-state');
+    return !!state&&state.textContent.trim()==='已签到';
+  }}).length;
+  var failed=rows.filter(function(row){{ return row.classList.contains('row-failed'); }}).length;
+  var summary=document.getElementById('checkin-summary');
+  if(summary) summary.textContent=(action||'已更新')+'：'+ok+' 已签到 / '+rows.length+' 个账号'+(failed?'，'+failed+' 个异常':'');
+  var updated=document.getElementById('checkin-updated');
+  if(updated) updated.textContent='更新于 '+new Date().toLocaleTimeString();
+  return {{ok:ok,failed:failed,total:rows.length}};
+}}
+function checkinFailureText(account){{
+  var code=responseCode(account&&account.data);
+  var message=(account&&account.error)||((account&&account.data&&account.data.message)||'未知错误');
+  return (account&&account.label||account&&account.id||'账号')+'：'+(code?'业务码 '+code+'，':'')+message;
+}}
+const CONN_PRESET = ['glm-5.3','glm-5.2','kimi-k2.7-code','kimi-k3','qwen3.8-max','DeepSeek-V4-Pro-Official','DeepSeek-V4-Flash-Official'];
+function fillConnPreset(){{
+  document.getElementById('conn-models').value = CONN_PRESET.join(', ');
+}}
+function connModelList(){{
+  var raw = document.getElementById('conn-models').value || '';
+  // Keep the newline escape intact when this script is rendered from the
+  // Python f-string.  A literal line break makes the whole inline script
+  // invalid JavaScript and disables every account/usage control on the page.
+  var items = raw.split(/[\\n,]+/).map(function(s){{ return s.trim(); }}).filter(Boolean);
+  return items.length ? items : CONN_PRESET.slice();
+}}
+function connModes(){{
+  var modes = [];
+  if(document.getElementById('conn-mode-text').checked) modes.push('text');
+  if(document.getElementById('conn-mode-tool').checked) modes.push('tool');
+  return modes;
+}}
+function connRow(model, mode){{
+  var tr = document.createElement('tr');
+  var label = mode === 'tool' ? '工具调用' : '文本回复';
+  [model, label, '排队中', '-', '-'].forEach(function(text, idx){{
+    var td = document.createElement('td');
+    td.textContent = text;
+    if(idx === 2) td.className = 'conn-status pending';
+    if(idx === 3) td.className = 'conn-time';
+    if(idx === 4) td.className = 'conn-detail';
+    tr.appendChild(td);
+  }});
+  return tr;
+}}
+async function runConnTest(){{
+  var btn = document.getElementById('conn-run-btn');
+  var table = document.getElementById('conn-table');
+  var tbody = document.getElementById('conn-tbody');
+  var summary = document.getElementById('conn-summary');
+  var models = connModelList();
+  var modes = connModes();
+  if(!modes.length){{ showMsg('conn-msg','请至少选择一种测试内容',false); return; }}
+  var timeout = parseInt(document.getElementById('conn-timeout').value,10) || 120;
+  var endpoint = document.getElementById('conn-endpoint').value || 'remote';
+  var effort = document.getElementById('conn-effort').value || '';
+  var thinking = document.getElementById('conn-thinking').checked;
+  var maxMode = document.getElementById('conn-max').checked;
+  btn.disabled = true;
+  table.hidden = false;
+  tbody.innerHTML = '';
+  showMsg('conn-msg','');
+  var jobs = [];
+  models.forEach(function(model){{
+    modes.forEach(function(mode){{
+      var tr = connRow(model, mode);
+      tbody.appendChild(tr);
+      jobs.push({{model: model, mode: mode, row: tr}});
+    }});
+  }});
+  var passed = 0, done = 0, endpointWarnings = [];
+  summary.textContent = '0/' + jobs.length + ' 完成';
+  for(var i = 0; i < jobs.length; i++){{
+    var job = jobs[i];
+    var statusCell = job.row.querySelector('.conn-status');
+    var timeCell = job.row.querySelector('.conn-time');
+    var detailCell = job.row.querySelector('.conn-detail');
+    statusCell.textContent = '测试中...';
+    statusCell.className = 'conn-status pending';
+    try{{
+      var d = await postJSON('/api/model-test',
+        {{model: job.model, mode: job.mode, timeout: timeout, endpoint: endpoint,
+          reasoning_effort: effort, thinking: thinking, max_mode: maxMode,
+          // This page compares one endpoint at a time.  Do not hide a native
+          // endpoint failure behind the API runtime's production fallback.
+          disable_fallback: true}}, (timeout + 20) * 1000);
+      timeCell.textContent = (d.elapsed_ms !== undefined ? d.elapsed_ms + ' ms' : '-');
+      if(d.success){{
+        passed++;
+        statusCell.textContent = '通过';
+        statusCell.className = 'conn-status ok';
+        var endpointDiagnostic=endpointDiagnosticText(d);
+        if(job.mode === 'tool'){{
+          var names = (d.tool_calls || []).map(function(c){{ return c.name; }}).join(', ');
+          detailCell.textContent = (d.auto_route ? 'auto -> ' : '') + 'endpoint=' + (d.actual_endpoint || d.actual_mode || '-')
+            + (d.fallback_used ? ' (fallback)' : '') + ' | tool=' + (names || '-')
+            + (d.provider_model_name ? ' | ' + d.provider_model_name : '');
+        }} else {{
+          detailCell.textContent = (d.auto_route ? 'auto -> ' : '') + 'endpoint=' + (d.actual_endpoint || d.actual_mode || '-')
+            + (d.fallback_used ? ' (fallback)' : '') + ' | ' + JSON.stringify(d.reply || '')
+            + (d.provider_model_name ? ' | ' + d.provider_model_name : '');
+        }}
+        if(endpointDiagnostic) detailCell.textContent += ' | ' + endpointDiagnostic;
+        if(endpointDiagnostic) endpointWarnings.push(endpointDiagnostic);
+        var extra = [];
+        if(d.requested_reasoning_effort){{
+          extra.push('强度=' + d.requested_reasoning_effort + ' -> '
+            + (d.reasoning_effort_applied || ('未生效: ' + (d.reasoning_effort_note || '模型不支持'))));
+        }}
+        if(maxMode){{
+          extra.push('Max=' + (d.max_mode_applied ? '已生效 ' + formatContext(d.max_context_tokens) : '未生效'));
+        }}
+        if(d.usage && d.usage.reasoning_tokens !== undefined && d.usage.reasoning_tokens !== null){{
+          extra.push('reasoning_tokens=' + d.usage.reasoning_tokens);
+        }}
+        if(extra.length) detailCell.textContent += ' | ' + extra.join(' | ');
+        if(d.reasoning){{
+          var rd = document.createElement('div');
+          rd.className = 'conn-reasoning';
+          rd.textContent = '思考: ' + d.reasoning;
+          detailCell.appendChild(rd);
+        }}
+      }} else {{
+        statusCell.textContent = '失败';
+        statusCell.className = 'conn-status fail';
+        var endpointDiagnostic=endpointDiagnosticText(d);
+        detailCell.textContent = String(d.error || 'unknown')
+          + (endpointDiagnostic ? ' | ' + endpointDiagnostic : '');
+        if(endpointDiagnostic) endpointWarnings.push(endpointDiagnostic);
+      }}
+    }}catch(e){{
+      statusCell.textContent = '失败';
+      statusCell.className = 'conn-status fail';
+      timeCell.textContent = '-';
+      detailCell.textContent = String(e);
+    }}
+    done++;
+    summary.textContent = done + '/' + jobs.length + ' 完成，通过 ' + passed;
+  }}
+  btn.disabled = false;
+  var allOk = passed === jobs.length;
+  showMsg('conn-msg', '测试结束：' + passed + '/' + jobs.length + ' 通过', allOk);
+  if(endpointWarnings.length) showToast('端点回落/失败诊断',
+    endpointWarnings.slice(0,3).join('\\n'),false,12000);
+}}
+async function refreshModels(){{
+  var el=document.getElementById('models-out');
+  var msg=document.getElementById('models-msg');
+  el.style.display='block';
+  el.textContent='加载中...';
+  try{{
+    var result=await requestJSON('/v1/models?refresh=true',{{method:'GET'}},45000);
+    var d=result.data;
+    if(!result.ok || !d || !Array.isArray(d.data)){{
+      throw new Error((d && d.error && d.error.message) || ('HTTP '+result.status));
+    }}
+    el.textContent=d.data.map(function(model,index){{ return String(index+1).padStart(2,'0')+'  '+String(model.id||''); }}).join('\\n');
+    showMsg('models-msg','成功获取 '+d.data.length+' 个模型',true);
+  }}catch(e){{
+    el.textContent=String(e);
+    showMsg('models-msg',String(e),false);
+  }}
+}}
+async function logout(){{
+  var d=await postJSON('/api/logout',{{}});
+  showMsg('auth-msg',d.success?'已登出':(d.error||'登出失败'),d.success);
+  if(d.success) setTimeout(function(){{ location.reload(); }},600);
+}}
+async function switchAccount(id){{
+  setSwitchBusy(true);
+  try{{
+    var d=await postJSON('/api/accounts/switch',{{account_id:id}},30000);
+    if(!d.success){{ showMsg('account-msg',d.error||'切换失败',false); return; }}
+    setActiveAccount(d.active||id,d.account||{{id:id}});
+    showMsg('account-msg','已切换到账号 '+String((d.account&&(d.account.label||d.account.user_id))||id),true,3000);
+  }}finally{{ setSwitchBusy(false); }}
+}}
+var accountModelDraft={{}};
+function setAccountModelVisual(id,enabled){{
+  var row=document.getElementById('row-'+id);
+  var input=row&&row.querySelector('input[data-action="model-toggle"]');
+  if(input) input.checked=!!enabled;
+  var state=document.getElementById('model-state-wrap-'+id);
+  if(state){{
+    state.innerHTML='<span class="badge '+(enabled?'badge-ok':'badge-none')+'">'+(enabled?'已开启':'已关闭')+'</span>';
+  }}
+}}
+function updateAccountModelSaveButton(){{
+  var btn=document.getElementById('account-model-save-btn');
+  if(btn) btn.disabled=Object.keys(accountModelDraft).length===0;
+}}
+function toggleAccountModel(id,input){{
+  if(!input) return;
+  var row=document.getElementById('row-'+id);
+  var baseline=row&&row.getAttribute('data-model-enabled')==='1';
+  var wanted=!!input.checked;
+  if(wanted===baseline) delete accountModelDraft[String(id)];
+  else accountModelDraft[String(id)]=wanted;
+  setAccountModelVisual(id,wanted);
+  updateAccountModelSaveButton();
+  showMsg('account-msg',Object.keys(accountModelDraft).length
+    ? '账号模型开关已修改，请点击“保存模型开关”后生效'
+    : '',true,4000);
+}}
+function markAccountModelDirty(id,input){{
+  // Account model switches are drafts; the toolbar Save button performs the
+  // actual writes in one batch so changing a switch never changes the server.
+  toggleAccountModel(id,input);
+}}
+async function saveAccountModelSettings(){{
+  var ids=Object.keys(accountModelDraft);
+  if(!ids.length) return;
+  var btn=document.getElementById('account-model-save-btn');
+  if(btn) btn.disabled=true;
+  var failed=[];
+  try{{
+    for(var i=0;i<ids.length;i++){{
+      var id=ids[i], wanted=!!accountModelDraft[id];
+      var d=await postJSON('/api/accounts/model-enabled',{{account_id:id,enabled:wanted}},30000);
+      if(!d.success){{ failed.push(id); continue; }}
+      setAccountModelVisual(id,!!d.model_enabled);
+      var savedRow=document.getElementById('row-'+id);
+      if(savedRow) savedRow.setAttribute('data-model-enabled',!!d.model_enabled?'1':'0');
+      delete accountModelDraft[id];
+    }}
+    if(failed.length){{
+      failed.forEach(function(id){{
+        var row=document.getElementById('row-'+id);
+        setAccountModelVisual(id,row&&row.getAttribute('data-model-enabled')==='1');
+      }});
+      showMsg('account-msg','部分账号保存失败：'+failed.join(', '),false,8000);
+    }}else showMsg('account-msg','账号模型请求开关已保存，每日签到不受影响',true,4000);
+  }}finally{{
+    updateAccountModelSaveButton();
+  }}
+}}
+async function removeAccount(id){{
+  if(!confirm('确定删除该账号？')) return;
+  var d=await postJSON('/api/accounts/remove',{{account_id:id}});
+  if(d.success) location.reload(); else showMsg('auth-msg',d.error||'删除失败',false);
+}}
+function markPollingDirty(){{
+  var btn=document.getElementById('poll-save-btn');
+  if(btn) btn.disabled=false;
+  showMsg('poll-msg','轮询设置已修改，点击“保存轮询设置”后生效',true,0);
+}}
+async function savePollingSettings(){{
+  var on=!!document.getElementById('poll-toggle').checked;
+  var mode=document.querySelector('input[name=poll-mode]:checked');
+  var modeVal=mode?mode.value:'round-robin';
+  var d=await postJSON('/api/polling',{{enabled:on,mode:modeVal}});
+  if(d.success){{
+    var btn=document.getElementById('poll-save-btn'); if(btn) btn.disabled=true;
+    var status=document.getElementById('poll-status');
+    var countMatch=status&&status.textContent.match(/当前账号数:\\s*(\\d+)/);
+    var accountCount=countMatch?countMatch[1]:'0';
+    if(status) status.textContent='当前账号数: '+(d.account_count||accountCount)+'，轮询: '+(d.enabled?'开':'关')+'（'+(d.mode||modeVal)+'）';
+    showMsg('poll-msg','轮询设置已保存',true,3000);
+  }}else showMsg('poll-msg',d.error||'保存失败',false);
+}}
+// Kept as a compatibility wrapper for older inline callers; changing a
+// setting must never persist it implicitly.
+function togglePolling(){{ markPollingDirty(); }}
+// Endpoint changes stay in the browser draft until the explicit Save button.
+// Serialize explicit writes so a slower, older request cannot finish after a
+// newer save and overwrite the current selection.
+let endpointSaveSerial=0;
+let endpointSaveQueue=Promise.resolve();
+let endpointLastGoodState=null;
+let endpointDirty=false;
+function markEndpointDirty(){{
+  endpointDirty=true;
+  var btn=document.getElementById('settings-save-btn'); if(btn) btn.disabled=false;
+  var msg=document.getElementById('settings-msg');
+  if(msg){{ msg.textContent='端点设置已修改，点击“保存设置”后生效'; msg.className='msg msg-pending'; }}
+}}
+function readEndpointSelection(){{
+  var selector=document.getElementById('settings-endpoint-preset');
+  var input=document.getElementById('settings-web');
+  var preset=selector?selector.value:'';
+  var map=(typeof ENDPOINT_PRESET_MAP !== 'undefined') ? ENDPOINT_PRESET_MAP : {{}};
+  var entry=map[preset]||null;
+  return {{
+    preset:preset,
+    endpoint_id:(entry&&preset)?preset:'',
+    web_base_url:input?(input.value||'').trim():'',
+    upstream_mode:entry?entry.mode:''
+  }};
+}}
+function restoreEndpointSelection(state){{
+  state=state||{{}};
+  var selector=document.getElementById('settings-endpoint-preset');
+  var input=document.getElementById('settings-web');
+  var map=(typeof ENDPOINT_PRESET_MAP !== 'undefined') ? ENDPOINT_PRESET_MAP : {{}};
+  var endpointId=String(state.endpoint_id||'').toLowerCase();
+  if(selector){{
+    if(endpointId&&map[endpointId]) selector.value=endpointId;
+    else if(state.preset==='__saved') selector.value='__saved';
+    else selector.value='';
+  }}
+  if(input&&state.web_base_url!==undefined&&state.web_base_url!==null){{
+    input.value=String(state.web_base_url);
+  }}
+}}
+async function saveSettings(){{
+  var serial=++endpointSaveSerial;
+  var state=readEndpointSelection();
+  var payload={{
+    web_base_url:state.web_base_url,
+    upstream_mode:state.upstream_mode,
+    endpoint_id:state.endpoint_id
+  }};
+  var task=endpointSaveQueue.then(async function(){{
+    var d=await postJSON('/api/settings',payload);
+    // A newer selection happened while this request was in flight.  The
+    // queued newer write owns the UI.
+    if(serial!==endpointSaveSerial) return d;
+    if(d&&d.success){{
+      var canonical=(d.settings&&typeof d.settings==='object')?d.settings:{{}};
+      var canonicalId=String(canonical.endpoint_id||state.endpoint_id||'').toLowerCase();
+      var canonicalUrl=canonical.web_base_url;
+      var map=(typeof ENDPOINT_PRESET_MAP !== 'undefined') ? ENDPOINT_PRESET_MAP : {{}};
+      if(canonicalId&&map[canonicalId]) canonicalUrl=map[canonicalId].base_url;
+      restoreEndpointSelection({{
+        preset:canonicalId?canonicalId:state.preset,
+        endpoint_id:canonicalId,
+        web_base_url:(canonicalUrl===undefined||canonicalUrl===null)?state.web_base_url:canonicalUrl
+      }});
+      endpointLastGoodState=readEndpointSelection();
+      endpointDirty=false;
+      var saveButton=document.getElementById('settings-save-btn'); if(saveButton) saveButton.disabled=true;
+      var endpointDiagnostic=endpointDiagnosticText(d);
+      showMsg('settings-msg',(d.note||'设置已保存')
+        + (endpointDiagnostic ? '\\n'+endpointDiagnostic : ''),true);
+      if(endpointDiagnostic) showEndpointDiagnostic(d,'端点设置');
+    }}else{{
+      restoreEndpointSelection(endpointLastGoodState||state);
+      var endpointDiagnostic=endpointDiagnosticText(d);
+      showMsg('settings-msg',((d&&d.error)||'保存失败')
+        + (endpointDiagnostic ? '\\n'+endpointDiagnostic : ''),false);
+      if(endpointDiagnostic) showEndpointDiagnostic(d,'端点设置失败');
+    }}
+    return d;
+  }}).catch(function(error){{
+    if(serial===endpointSaveSerial){{
+      restoreEndpointSelection(endpointLastGoodState||state);
+      endpointDirty=false;
+      var saveButton=document.getElementById('settings-save-btn'); if(saveButton) saveButton.disabled=true;
+      showMsg('settings-msg',String(error||'保存失败'),false);
+    }}
+    return {{success:false,error:String(error||'保存失败')}};
+  }});
+  // Keep the queue alive after a failed request, while still returning this
+  // request's result to the caller that initiated the save.
+  endpointSaveQueue=task.catch(function(){{}});
+  return task;
+}}
+async function saveRelayServiceSettings(){{
+  var input=document.getElementById('settings-port');
+  var port=(input&&input.value||'').trim();
+  var value=Number(port);
+  if(!/^\\d+$/.test(port)||value<1||value>65535){{
+    showMsg('relay-service-msg','请输入 1-65535 的端口号',false);
+    return;
+  }}
+  var d=await postJSON('/api/settings',{{relay_port:value}});
+  if(d.success){{
+    var saveButton=document.getElementById('relay-service-save-btn');
+    if(saveButton) saveButton.disabled=true;
+    showMsg('relay-service-msg',d.note||'服务设置已保存，重启容器后生效',true,6000);
+  }}else showMsg('relay-service-msg',d.error||'保存失败',false);
+}}
+function markRelayServiceDirty(){{
+  var button=document.getElementById('relay-service-save-btn');
+  if(button) button.disabled=false;
+  showMsg('relay-service-msg','服务设置已修改，点击“保存服务设置”后生效',true,0);
+}}
+function markAutoRouteDirty(){{
+  var button=document.getElementById('auto-route-save-btn');
+  if(button) button.disabled=false;
+  showMsg('auto-route-msg','自动路由设置已修改，点击“保存自动路由”后生效',true,0);
+}}
+async function saveAutoRoute(){{
+  var toggle=document.getElementById('auto-route-toggle');
+  var d=await postJSON('/api/auto-route',{{enabled:toggle.checked}});
+  if(d.success){{
+    toggle.checked=!!d.enabled;
+    var button=document.getElementById('auto-route-save-btn');
+    if(button) button.disabled=true;
+    setStatePill('auto-route-state',d.enabled?'已开启':'已关闭',d.enabled);
+    showMsg('auto-route-msg',d.enabled?'自动路由已开启，下一个请求生效':'自动路由已关闭，使用预设端点',true,3000);
+  }} else {{
+    showMsg('auto-route-msg',d.error||'保存失败',false);
+  }}
+}}
+function markMaxModeDirty(){{
+  var button=document.getElementById('max-mode-save-btn');
+  if(button) button.disabled=false;
+  showMsg('max-mode-msg','Max 模式设置已修改，点击“保存”后生效',true,0);
+}}
+async function saveMaxMode(){{
+  var enabled=document.getElementById('max-mode-toggle').checked;
+  var models=document.getElementById('max-mode-models').value.trim();
+  var d=await postJSON('/api/max-mode',{{enabled:enabled,models:models}});
+  if(d.success){{
+    document.getElementById('max-mode-toggle').checked=!!d.enabled;
+    document.getElementById('max-mode-models').value=d.models||'';
+    var button=document.getElementById('max-mode-save-btn');
+    if(button) button.disabled=true;
+    setStatePill('max-mode-state',d.enabled?'已开启':'已关闭',d.enabled);
+    showMsg('max-mode-msg',d.enabled?'Max 模式已开启，新会话生效':'Max 模式已关闭',true,3000);
+  }} else showMsg('max-mode-msg',d.error||'保存失败',false);
+}}
+function formatContext(n){{
+  if(!n) return '';
+  return n>=1000000 ? (Math.round(n/100000)/10)+'M' : Math.round(n/1000)+'K';
+}}
+function addMaxModel(name){{
+  var input=document.getElementById('max-mode-models');
+  var items=input.value.split(',').map(function(s){{ return s.trim(); }}).filter(Boolean);
+  var lower=items.map(function(s){{ return s.toLowerCase(); }});
+  if(lower.indexOf(name.toLowerCase())<0){{
+    items.push(name);
+    input.value=items.join(', ');
+    markMaxModeDirty();
+  }}
+}}
+async function detectMaxModels(){{
+  var btn=document.getElementById('max-mode-detect-btn');
+  var out=document.getElementById('max-mode-models-out');
+  btn.disabled=true;
+  try{{
+    var result=await requestJSON('/api/max-mode/models',{{method:'GET'}},45000);
+    var d=result.data;
+    if(!result.ok||!d||!d.success) throw new Error(apiError(d,result.status));
+    out.textContent='';
+    var list=d.models||[];
+    if(!list.length) out.textContent='当前账号没有支持 Max 的模型';
+    list.forEach(function(m){{
+      var chip=document.createElement('button');
+      chip.type='button';
+      chip.className='model-chip';
+      chip.textContent=m.name+(m.max_context?' · '+formatContext(m.max_context):'');
+      chip.title='加入生效模型';
+      chip.onclick=function(){{ addMaxModel(m.name); }};
+      out.appendChild(chip);
+    }});
+    out.hidden=false;
+  }}catch(e){{ showMsg('max-mode-msg',String(e),false,8000); }}
+  finally{{ btn.disabled=false; }}
+}}
+const ENDPOINT_PRESET_MAP = {endpoint_map_json};
+endpointLastGoodState=readEndpointSelection();
+function applyEndpointPreset(){{
+  var selector=document.getElementById('settings-endpoint-preset');
+  var input=document.getElementById('settings-web');
+  if(!selector||!input) return;
+  var map=ENDPOINT_PRESET_MAP;
+  var entry=map[selector.value]||null;
+  var value=entry?entry.base_url:'';
+  if(value) input.value=value;
+  // Selecting a preset only updates the draft URL.  The explicit Save button
+  // is the sole path that persists endpoint settings.
+  markEndpointDirty();
+}}
+async function checkinRefreshAll(){{
+  setBusy(true);
+  try{{
+    var result=await requestJSON('/api/checkin/accounts',{{method:'GET'}},90000);
+    var d=result.data;
+    if(!result.ok||!d||!d.success){{ throw new Error(apiError(d,result.status)); }}
+    var accounts=d.accounts||[];
+    accounts.forEach(updateAccountCheckinRow);
+    var summary=updateCheckinSummary(accounts,'签到状态查询完成');
+    var failures=accounts.filter(function(a){{ return a.error; }});
+    if(failures.length){{
+      showMsg('checkin-msg','签到状态查询完成，但有 '+failures.length+' 个账号失败：\\n'+failures.slice(0,3).map(checkinFailureText).join('\\n'),false,12000);
+    }}else{{
+      showMsg('checkin-msg','签到状态查询成功，已刷新 '+summary.total+' 个账号',true,3000);
+    }}
+  }}catch(e){{ showMsg('checkin-msg',String(e),false,12000); }}
+  finally{{ setBusy(false); }}
+}}
+async function creditsRefreshAll(){{
+  setBusy(true);
+  try{{
+    var result=await requestJSON('/api/checkin/credits/accounts',{{method:'GET'}},90000);
+    var d=result.data;
+    if(!result.ok||!d||!d.success){{ throw new Error(apiError(d,result.status)); }}
+    var accounts=d.accounts||[];
+    accounts.forEach(updateAccountCreditsRow);
+    var failures=accounts.filter(function(a){{ return a.error; }});
+    var summary=document.getElementById('checkin-summary');
+    if(summary) summary.textContent='积分查询完成：'+(accounts.length-failures.length)+' / '+accounts.length+' 个账号'+(failures.length?'，'+failures.length+' 个异常':'');
+    var updated=document.getElementById('checkin-updated');
+    if(updated) updated.textContent='更新于 '+new Date().toLocaleTimeString();
+    if(failures.length){{
+      showMsg('checkin-msg','积分查询完成，但有 '+failures.length+' 个账号失败：\\n'+failures.slice(0,3).map(checkinFailureText).join('\\n'),false,12000);
+    }}else{{
+      showMsg('checkin-msg','积分查询成功，已刷新 '+accounts.length+' 个账号',true,3000);
+    }}
+  }}catch(e){{ showMsg('checkin-msg',String(e),false,12000); }}
+  finally{{ setBusy(false); }}
+}}
+async function checkinAccount(id){{
+  setAccountCheckinBusy(id,true);
+  try{{
+    var result=await requestJSON('/api/checkin/account/'+encodeURIComponent(id),{{method:'POST',headers:{{'Content-Type':'application/json'}},body:'{{}}'}},90000);
+    var d=result.data||{{}};
+    var account={{id:id,data:d.data,checked_in:d.checked_in,account_credits:d.account_credits,success:d.success,error:d.success?'':apiError(d,result.status)}};
+    updateAccountRow(account);
+    if(!result.ok||!d||!d.success){{ showMsg('checkin-msg','账号 '+id+' 签到失败：'+apiError(d,result.status),false,12000); return; }}
+    account.checked_in=true;
+    account.error='';
+    updateAccountRow(account);
+    updateVisibleCheckinSummary('签到完成');
+    showMsg('checkin-msg',d.skipped?'账号 '+id+' 已签到，无需重复操作':'账号 '+id+' 签到成功（业务码 '+(responseCode(d)||'0')+'）',true,3000);
+  }}catch(e){{ showMsg('checkin-msg',String(e),false,12000); }}
+  finally{{ setAccountCheckinBusy(id,false); }}
+}}
+async function checkinClaimAll(){{
+  if(!confirm('确定按顺序逐个对所有账号签到？')) return;
+  setBusy(true);
+  try{{
+    var accountCount=document.querySelectorAll('tr[data-account-id]').length;
+    var timeoutMs=Math.max(900000,(accountCount+1)*({CHECKIN_INTERVAL}+5)*1000);
+    var result=await requestJSON('/api/checkin/claim-all',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:'{{}}'}},timeoutMs);
+    var d=result.data;
+    if(!result.ok||!d||!d.success){{ throw new Error(apiError(d,result.status)); }}
+    var accounts=d.accounts||[];
+    accounts.forEach(updateAccountRow);
+    var summary=updateCheckinSummary(accounts,'轮询完成');
+    if(summary.failed){{
+      showMsg('checkin-msg','轮询完成：'+summary.failed+' 个账号失败\\n'+accounts.filter(function(a){{return a.error||a.success===false;}}).slice(0,5).map(checkinFailureText).join('\\n'),false,12000);
+    }}else{{
+      showMsg('checkin-msg','轮询签到成功，'+summary.ok+' 个账号已签到',true,3000);
+    }}
+  }}catch(e){{ showMsg('checkin-msg',String(e),false,12000); }}
+  finally{{ setBusy(false); }}
+}}
+function formatCheckinTime(iso){{
+  if(!iso) return '-';
+  var m=String(iso).match(/^(\\d{{4}})-(\\d{{2}})-(\\d{{2}})T(\\d{{2}}):(\\d{{2}})/);
+  return m ? (m[2]+'-'+m[3]+' '+m[4]+':'+m[5]) : String(iso);
+}}
+let autoCheckinDirty=false;
+function markAutoCheckinDirty(){{
+  autoCheckinDirty=true;
+  var button=document.getElementById('auto-checkin-save-btn');
+  if(button) button.disabled=false;
+  showMsg('auto-checkin-msg','自动签到设置已修改，点击“保存”后生效',true,0);
+}}
+function renderAutoCheckin(d){{
+  if(!d||!d.success) return;
+  var toggle=document.getElementById('auto-checkin-toggle');
+  var timeInput=document.getElementById('auto-checkin-time');
+  // A background status refresh must not overwrite edits that have not been
+  // saved yet.  It may still update the read-only execution status below.
+  if(!autoCheckinDirty){{
+    if(toggle) toggle.checked=!!d.enabled;
+    if(timeInput&&d.time) timeInput.value=d.time;
+  }}
+  setStatePill('auto-checkin-state',d.running?'正在执行...':(d.enabled?('每天 '+d.time+' 自动签到'):'已关闭'),d.enabled||d.running);
+  document.getElementById('auto-checkin-next').textContent=d.enabled?formatCheckinTime(d.next_run):'未启用';
+  document.getElementById('auto-checkin-last').textContent=d.last_run_at
+    ? formatCheckinTime(d.last_run_at)+(d.last_trigger==='manual'?'（手动）':'（定时）') : '-';
+  var s=d.summary;
+  document.getElementById('auto-checkin-result').textContent=s
+    ? ('成功 '+s.ok+' / 跳过 '+s.skipped+' / 失败 '+s.failed+(s.no_token?(' / 无凭证 '+s.no_token):'')) : '-';
+  var runBtn=document.getElementById('auto-checkin-run-btn');
+  if(runBtn) runBtn.disabled=!!d.running;
+}}
+async function loadAutoCheckin(){{
+  try{{
+    var result=await requestJSON('/api/auto-checkin',{{method:'GET'}},15000);
+    renderAutoCheckin(result.data);
+    return result.data;
+  }}catch(e){{ return null; }}
+}}
+async function saveAutoCheckin(){{
+  var toggle=document.getElementById('auto-checkin-toggle');
+  var timeValue=document.getElementById('auto-checkin-time').value;
+  if(!/^\\d{{2}}:\\d{{2}}$/.test(timeValue||'')){{ showMsg('auto-checkin-msg','请填写有效的签到时间（HH:MM）',false); return; }}
+  var d=await postJSON('/api/auto-checkin',{{enabled:toggle.checked,time:timeValue}});
+  if(d.success){{
+    autoCheckinDirty=false;
+    var button=document.getElementById('auto-checkin-save-btn');
+    if(button) button.disabled=true;
+    renderAutoCheckin(d);
+    showMsg('auto-checkin-msg',d.enabled?('已开启，每天 '+d.time+' 自动签到所有账号'):'自动签到已关闭',true,3000);
+  }} else showMsg('auto-checkin-msg',d.error||'保存失败',false);
+}}
+var autoCheckinPoll=null;
+async function runAutoCheckinNow(){{
+  if(!confirm('立即按顺序签到所有未签到账号？已签到账号会自动跳过。')) return;
+  var d=await postJSON('/api/auto-checkin/run',{{}});
+  if(!d.success){{ showMsg('auto-checkin-msg',d.error||'启动失败',false); return; }}
+  renderAutoCheckin(d);
+  showMsg('auto-checkin-msg',d.started?'已开始执行，账号之间按签到间隔依次处理':'已有签到任务在执行',true,4000);
+  clearInterval(autoCheckinPoll);
+  autoCheckinPoll=setInterval(async function(){{
+    var latest=await loadAutoCheckin();
+    if(latest&&!latest.running){{
+      clearInterval(autoCheckinPoll);
+      if(typeof checkinRefreshAll==='function'&&latest.summary&&latest.summary.ok) showMsg('auto-checkin-msg','执行完成，可点击“查询签到状态”刷新列表',true,5000);
+    }}
+  }},5000);
+}}
+loadAutoCheckin();
+setInterval(loadAutoCheckin,60000);
+(function(){{
+  var initial=(location.hash||'').replace('#','');
+  if(initial&&document.querySelector('.tab-page[data-page="'+initial+'"]')) switchTab(initial);
+}})();
+syncSelection();
+window.addEventListener('resize',syncSelection);
+if(document.fonts&&document.fonts.ready) document.fonts.ready.then(syncSelection);
+var manualForm=document.getElementById('manual-form');
+if(manualForm) manualForm.addEventListener('submit',async function(e){{
+  e.preventDefault();var fd=new FormData(e.target);
+  var payload={{}};
+  for(var[k,v]of fd.entries())if(v)payload[k]=v;
+  var d=await postJSON('/api/web-auth',payload);
+  showMsg('manual-msg',d.success?'账号已添加':d.error||'提交失败',d.success);
+  if(d.success) setTimeout(function(){{ location.reload(); }},600);
+}});
+</script>
+</body>
+</html>"""
+
+
+def _oauth_result_html(success: bool, message: str, login_trace_id: str = "") -> str:
+    safe_msg = html_mod.escape(message)
+    safe_trace = html_mod.escape(login_trace_id)
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>Trae 授权</title>{_FAVICON_LINKS}
+<style>
+body {{ font:16px -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:#eef0f4;color:#1d2331;padding:40px; }}
+.msg {{ padding:20px;border-radius:10px;margin-bottom:16px;border:1px solid; }}
+.ok {{ background:#e2f3eb;color:#0a7451;border-color:#bfe3d3; }}
+.err {{ background:#fdecec;color:#dc2626;border-color:#f3c6c6; }}
+</style>
+</head>
+<body>
+<div class="msg {'ok' if success else 'err'}">
+  <h2 style="margin:0 0 8px">{'成功' if success else '失败'}</h2>
+  <p>{safe_msg}</p>
+</div>
+<script>
+(function(){{
+  // 授权回调由 Trae 授权页直接跳转到服务器 /authorize。
+  // 成功后回到控制台自动刷新，失败则停留展示错误。
+  if ({str(success).lower()}) {{
+    setTimeout(function(){{ window.location.href = '/web/login'; }}, 1200);
+  }}
+}})();
+</script>
+</body>
+</html>"""
+
+
+async def _peek_async(ait):
+    try:
+        first = await ait.__anext__()
+    except StopAsyncIteration:
+        return None, ait
+
+    async def chain():
+        yield first
+        async for item in ait:
+            yield item
+
+    return first, chain()
+
+
+async def _empty_cli_events():
+    if False:
+        yield None
+
+
+def _sse_headers() -> dict:
+    return {
+        "Cache-Control": "no-cache, no-transform",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+        "X-Content-Type-Options": "nosniff",
+    }
+
+
+def _stream_heartbeat_seconds() -> float:
+    try:
+        value = float(os.environ.get("SSE_HEARTBEAT_SECONDS", "1"))
+    except (TypeError, ValueError):
+        value = 1.0
+    return max(0.0, value)
+
+
+def _stream_error_event(response) -> str:
+    """Turn a late upstream failure into an OpenAI-compatible SSE error."""
+    raw = getattr(response, "body", b"")
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+    try:
+        payload = json.loads(raw or "{}")
+    except Exception:
+        payload = {}
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(error, dict):
+        error = {
+            "message": str(payload or "Upstream stream failed"),
+            "type": "api_error",
+        }
+    return "data: " + json.dumps({"error": error}, ensure_ascii=False) + "\n\n"
+
+
+def _stream_start_event(model: str) -> str:
+    """Send a parseable SSE frame while the first Trae frame is pending.
+
+    A comment-only keepalive is legal SSE, but a few terminal clients treat it
+    as an empty response and close/retry before the upstream request finishes.
+    An empty OpenAI delta keeps those clients attached without exposing text or
+    inventing a completion.
+
+    The delta is deliberately empty: emitting ``role`` here would duplicate the
+    translator's own opening frame, and the OpenAI stream contract carries the
+    assistant role exactly once.
+    """
+    return (
+        "data: "
+        + json.dumps(
+            {
+                "id": "",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": ""},
+                        "finish_reason": None,
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        )
+        + "\n\n"
+    )
+
+
+async def _deferred_dispatch_stream(
+    messages: list[dict], model: str, options: Optional[dict] = None
+):
+    """Open the public SSE stream before waiting for Trae's upstream headers.
+
+    This keeps fallback routing intact because `_dispatch_chat` still performs
+    the complete route selection in one task.  The task itself is awaited with
+    keepalives, so a slow upstream cannot leave the client staring at a blank
+    connection or freeze the event loop.
+    """
+    # Start routing before emitting any keepalive.  Some terminal clients
+    # (notably zcode) treat a comment-only first frame as an empty cached
+    # response and close the HTTP stream before asking for the next frame. The
+    # old ordering created the upstream task *after* that first yield, so the
+    # request could be cancelled without ever reaching Trae.
+    options = _apply_auto_route(messages, options)
+    requested_mode = str(
+        options.get("_upstream_mode") or _current_upstream_mode()
+    ).strip().lower()
+    fallback_allowed = (
+        not bool(options.get("_disable_upstream_fallback"))
+        and requested_mode
+        in {
+            "raw",
+            "direct",
+            "auto",
+            "ide",
+            "solo",
+            "work-agent",
+            "traework-native",
+            "native",
+            "traework",
+        }
+    )
+    fallback_attempted = False
+    task = asyncio.create_task(_dispatch_chat(messages, model, True, options))
+    dispatch_claimed = False
+    response = None
+    iterator = None
+    request_id = str((options or {}).get("_relay_request_id") or "")
+    started_at = time.monotonic()
+    upstream_chunks = 0
+    upstream_payload_chunks = 0
+    saw_done = False
+    stream_status = "opening"
+    sent_start_event = False
+
+    async def close_current() -> None:
+        """Close the currently selected response/iterator before a retry."""
+
+        nonlocal iterator, response
+        if iterator is None:
+            iterator = getattr(response, "body_iterator", None)
+        if iterator is not None:
+            close_iterator = getattr(iterator, "aclose", None)
+            if close_iterator is not None:
+                try:
+                    await close_iterator()
+                except Exception:
+                    pass
+            iterator = None
+        close_response = getattr(response, "close", None)
+        if close_response is not None:
+            try:
+                close_response()
+            except Exception:
+                pass
+        response = None
+
+    async def try_remote_fallback(reason: str):
+        """Open one Remote stream after a native path fails before output."""
+
+        nonlocal fallback_attempted, response
+        if not fallback_allowed or fallback_attempted:
+            return None
+        fallback_attempted = True
+        trace = options.get("_upstream_trace")
+        _trace_append_failure(trace, requested_mode, reason)
+        if isinstance(trace, dict):
+            trace.update(
+                fallback_used=True,
+                fallback_target="remote",
+            )
+        fallback_options = _remote_fallback_options(options, requested_mode)
+        logger.warning(
+            "stream endpoint failed before output; falling back to remote "
+            "id=%s requested_mode=%s reason=%s",
+            request_id,
+            requested_mode,
+            reason,
+        )
+        try:
+            fallback = await _dispatch_chat(
+                messages, model, True, fallback_options
+            )
+        except Exception as exc:
+            logger.warning(
+                "stream remote fallback failed id=%s requested_mode=%s error=%s",
+                request_id,
+                requested_mode,
+                exc,
+            )
+            return None
+        if _upstream_response_error(fallback):
+            logger.warning(
+                "stream remote fallback returned error id=%s requested_mode=%s detail=%s",
+                request_id,
+                requested_mode,
+                _upstream_response_error(fallback),
+            )
+            response = fallback
+            await close_current()
+            return None
+        if isinstance(trace, dict):
+            trace.update(
+                actual_mode="remote",
+                actual_endpoint="remote",
+                fallback_used=True,
+                fallback_target="remote",
+            )
+        return fallback
+
+    async def forward_response(current_response):
+        """Forward one StreamingResponse and propagate pre-output failures."""
+
+        nonlocal iterator, upstream_chunks, upstream_payload_chunks
+        nonlocal saw_done, stream_status, sent_start_event
+        iterator = getattr(current_response, "body_iterator", None)
+        if iterator is None:
+            body = getattr(current_response, "body", b"")
+            if body:
+                yield body.decode("utf-8", errors="replace") if isinstance(body, bytes) else str(body)
+            return
+        async for chunk in iterator:
+            if isinstance(chunk, bytes):
+                chunk = chunk.decode("utf-8", errors="replace")
+            if chunk:
+                upstream_chunks += 1
+                if any(
+                    line.lstrip().startswith("data:")
+                    for line in chunk.splitlines()
+                ):
+                    upstream_payload_chunks += 1
+                if "data: [DONE]" in chunk:
+                    saw_done = True
+                    stream_status = "completed"
+                if not sent_start_event and chunk.lstrip().startswith(":"):
+                    yield _stream_start_event(model)
+                    sent_start_event = True
+                yield chunk
+
+    async def close_dispatch() -> None:
+        nonlocal response, iterator
+        if not task.done():
+            task.cancel()
+        try:
+            dispatched_response = await task
+        except (asyncio.CancelledError, Exception):
+            pass
+        else:
+            # Dispatch may have finished while the public stream was paused
+            # at its initial frame, before it could take response ownership.
+            if not dispatch_claimed:
+                response = dispatched_response
+        if iterator is None and response is not None:
+            iterator = getattr(response, "body_iterator", None)
+        await close_current()
+
+    try:
+        # Enter the selected transport before emitting the first keepalive,
+        # while retaining ownership if cancellation occurs in this handoff.
+        await asyncio.sleep(0)
+        # The task may still be establishing the Trae request.  Emit one real
+        # data frame before comment heartbeats so zcode/OpenCode does not treat
+        # the stream as an empty cached response and cancel the task.
+        if not task.done():
+            yield _stream_start_event(model)
+            sent_start_event = True
+        interval = _stream_heartbeat_seconds()
+        while True:
+            try:
+                if interval > 0:
+                    response = await asyncio.wait_for(
+                        asyncio.shield(task), interval
+                    )
+                else:
+                    response = await task
+                dispatch_claimed = True
+                break
+            except asyncio.TimeoutError:
+                yield ": relay-keepalive\n\n"
+
+        if getattr(response, "status_code", 200) >= 400:
+            upstream_error = _upstream_response_error(response) or "http error"
+            error_event = _stream_error_event(response)
+            await close_current()
+            fallback = await try_remote_fallback(
+                upstream_error
+            )
+            if fallback is None:
+                stream_status = "upstream_error"
+                yield error_event
+                yield "data: [DONE]\n\n"
+                saw_done = True
+                return
+            response = fallback
+
+        try:
+            async for chunk in forward_response(response):
+                yield chunk
+        except (asyncio.CancelledError, GeneratorExit):
+            raise
+        except Exception as exc:
+            if isinstance(exc, EmptyUpstreamResponse):
+                _track_usage_from_exception(exc, model)
+                if not exc.retryable or exc.observed_model_event:
+                    raise
+            # A StreamingResponse can be returned with HTTP 200 and fail only
+            # when its body iterator starts (empty native SSE, invalid headers,
+            # or a provider disconnect).  Retry Remote only before any native
+            # payload has reached the caller; once partial output is visible we
+            # preserve that stream and surface the original failure.
+            if upstream_payload_chunks or fallback_attempted:
+                raise
+            await close_current()
+            fallback = await try_remote_fallback(str(exc))
+            if fallback is None:
+                raise
+            response = fallback
+            async for chunk in forward_response(response):
+                yield chunk
+        stream_status = "completed"
+    except asyncio.CancelledError:
+        if saw_done:
+            # The upstream already emitted [DONE]; a client disconnecting
+            # during final teardown is not an aborted model turn.
+            stream_status = "completed"
+            logger.info(
+                "public stream cancelled after done id=%s chunks=%d elapsed_ms=%d",
+                request_id,
+                upstream_chunks,
+                int((time.monotonic() - started_at) * 1000),
+            )
+        else:
+            stream_status = "client_cancelled"
+            logger.warning(
+                "public stream cancelled id=%s upstream_ready=%s task_done=%s chunks=%d elapsed_ms=%d",
+                request_id,
+                response is not None,
+                task.done(),
+                upstream_chunks,
+                int((time.monotonic() - started_at) * 1000),
+            )
+        raise
+    except GeneratorExit:
+        stream_status = "client_closed" if not saw_done else "completed"
+        raise
+    except Exception as exc:
+        stream_status = "error"
+        _track_usage_from_exception(exc, model)
+        logger.warning("deferred stream dispatch failed: %s", exc)
+        yield "data: " + json.dumps(
+            {"error": {"message": str(exc), "type": "api_error"}},
+            ensure_ascii=False,
+        ) + "\n\n"
+        yield "data: [DONE]\n\n"
+        saw_done = True
+    finally:
+        await _await_session_cleanup(asyncio.create_task(close_dispatch()))
+        logger.info(
+            "public stream closed id=%s status=%s chunks=%d done=%s elapsed_ms=%d",
+            request_id,
+            stream_status,
+            upstream_chunks,
+            saw_done,
+            int((time.monotonic() - started_at) * 1000),
+        )
+
+
+def _tool_translation_options(
+    options: Optional[dict], messages: Optional[list[dict]] = None
+) -> dict:
+    options = options or {}
+    has_explicit_catalog = "tools" in options or "_inherited_tools" in options
+    tool_catalog = (
+        options["tools"]
+        if "tools" in options
+        else options.get("_inherited_tools", [])
+    )
+    # TraeWork's custom-model adapter owns the local toolhost and its raw
+    # six-field request normally has no OpenAI ``tools`` array.  Passing an
+    # empty list to the OpenAI translator means "suppress every tool call";
+    # for this ingress that would turn a valid model tool request into plain
+    # text and the desktop client could never execute it.  ``None`` preserves
+    # the caller-owned protocol and lets the custom SSE adapter forward calls
+    # parsed from native fields or the XML marker in the model response.
+    if options.get("_traework_custom_model") and not has_explicit_catalog:
+        tool_catalog = None
+    return {
+        # API callers execute tools. With no tools field, suppress any internal
+        # Trae tool event instead of exposing a call the client cannot handle.
+        "allowed_tools": tool_catalog,
+        "tool_choice": options.get("tool_choice"),
+        "parallel_tool_calls": options.get("parallel_tool_calls"),
+        # Keep reasoning presentation separate from the raw upstream request.
+        # ``thinking`` is intentionally consumed only by the translators.
+        "include_reasoning": responses_api.thinking_requested(options),
+        # Protect the continuation turn from an upstream model that echoes an
+        # already completed call with a fresh id. A new user message after the
+        # result clears this set in cli_client.completed_tool_signatures().
+        "completed_tool_signatures": cli_client.completed_tool_signatures(
+            messages or []
+        ),
+    }
+
+
+def _tool_protocol_requested(
+    options: Optional[dict], messages: Optional[list[dict]] = None
+) -> bool:
+    options = options or {}
+    if options.get("_tool_protocol_requested") or any(
+        key in options for key in ("tools", "tool_choice", "parallel_tool_calls")
+    ):
+        return True
+    return any(
+        isinstance(message, dict) and _message_contains_tool_protocol(message)
+        for message in (messages or [])
+    )
+
+
+def _message_contains_tool_protocol(message: Mapping[str, Any]) -> bool:
+    """Detect OpenAI and TraeWork renderer tool messages in request history.
+
+    TraeWork does not always use an OpenAI ``role=tool`` message. Its renderer
+    serializes calls/results as ``tool_use``/``tool_result`` content blocks,
+    with results commonly carried by a ``role=user`` message. Those turns
+    still require the tool-aware runtime prompt and the raw-safe route.
+    """
+
+    role = str(message.get("role") or "").strip().lower()
+    if role in {"tool", "function"}:
+        return True
+    if role == "assistant" and (
+        (isinstance(message.get("tool_calls"), list) and bool(message["tool_calls"]))
+        or isinstance(message.get("function_call"), Mapping)
+    ):
+        return True
+    content = message.get("content")
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(block, Mapping)
+        and str(block.get("type") or "").strip().lower()
+        in {"tool_use", "tool_call", "function_call", "tool_result"}
+        for block in content
+    )
+
+
+def _with_auto_client_context(
+    req: Request,
+    body: Mapping[str, Any],
+    messages: list[dict],
+    options: dict,
+) -> dict:
+    """Infer caller environment and plugin catalog when the client omitted it."""
+
+    if not _tool_protocol_requested(options, messages):
+        return options
+    if "client_context" in options or "clientContext" in options:
+        return options
+    # OpenAI clients commonly send `metadata`, while new-api's Responses DTO
+    # preserves the equivalent caller hints under `client_metadata`.
+    metadata = body.get("client_metadata") or body.get("metadata")
+    metadata = metadata if isinstance(metadata, Mapping) else {}
+    enriched = dict(options)
+    enriched["client_context"] = raw_client.build_client_context(
+        enriched,
+        request_headers=dict(req.headers),
+        metadata=metadata,
+    )
+    return enriched
+
+
+def _request_session_hint(req: Request, body: Mapping[str, Any]) -> str:
+    """Read common conversation-id aliases without exposing them downstream."""
+    for key in ("session_id", "sessionId", "conversation_id", "conversationId"):
+        value = body.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    metadata = body.get("client_metadata") or body.get("metadata")
+    if isinstance(metadata, Mapping):
+        for key in ("session_id", "sessionId", "conversation_id", "conversationId"):
+            value = metadata.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    for key in (
+        "x-session-id",
+        "x-conversation-id",
+        "x-chat-session-id",
+        "conversation-id",
+    ):
+        value = req.headers.get(key)
+        if value and value.strip():
+            return value.strip()
+    return ""
+
+
+def _apply_tool_header_hints(req: Request, options: dict) -> dict:
+    """Accept optional tool-policy hints used by nonstandard terminal clients.
+
+    OpenAI places tool definitions in JSON, not headers. Some adapters still
+    send a small ``Tool``/``X-Tools`` hint; treat it as a routing signal and,
+    when it contains JSON, restore the same options that would have appeared in
+    the request body. Arbitrary client headers are never forwarded upstream.
+    """
+
+    enriched = dict(options)
+    saw_hint = False
+    for header in ("tools", "tool", "x-tools", "x-tool"):
+        value = req.headers.get(header)
+        if not value:
+            continue
+        saw_hint = True
+        if "tools" in enriched:
+            continue
+        try:
+            parsed = json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(parsed, list):
+            enriched["tools"] = parsed
+    for header in ("tool-choice", "x-tool-choice"):
+        value = req.headers.get(header)
+        if not value:
+            continue
+        saw_hint = True
+        if "tool_choice" in enriched:
+            continue
+        try:
+            enriched["tool_choice"] = json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            enriched["tool_choice"] = value
+    for header in ("parallel-tool-calls", "x-parallel-tool-calls"):
+        value = req.headers.get(header)
+        if not value:
+            continue
+        saw_hint = True
+        if "parallel_tool_calls" not in enriched:
+            enriched["parallel_tool_calls"] = value.strip().lower() in {
+                "1", "true", "yes", "on",
+            }
+    if saw_hint:
+        enriched["_tool_protocol_requested"] = True
+    return enriched
+
+
+def _chat_history_key(messages: list[dict], length: int | None = None) -> str:
+    selected = messages if length is None else messages[:length]
+    encoded = json.dumps(
+        selected,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _chat_has_prior_turn(messages: list[dict]) -> bool:
+    return any(
+        isinstance(message, dict)
+        and message.get("role") in {"assistant", "tool", "function"}
+        for message in messages
+    )
+
+
+def _prune_chat_sessions(now: float) -> None:
+    cutoff = now - _CHAT_SESSION_TTL
+    while _CHAT_HISTORY_SESSIONS:
+        key, (_session_id, touched) = next(iter(_CHAT_HISTORY_SESSIONS.items()))
+        if touched >= cutoff and len(_CHAT_HISTORY_SESSIONS) <= _CHAT_SESSION_MAX:
+            break
+        _CHAT_HISTORY_SESSIONS.pop(key, None)
+
+    for session_id, lease in list(_UPSTREAM_SESSION_LEASES.items()):
+        expired = lease.last_client_activity < cutoff
+        oversized = len(_UPSTREAM_SESSION_LEASES) > _CHAT_SESSION_MAX
+        if lease.active_streams or (not expired and not oversized):
+            continue
+        _UPSTREAM_SESSION_LEASES.pop(session_id, None)
+        for key, (history_session_id, _touched) in list(
+            _CHAT_HISTORY_SESSIONS.items()
+        ):
+            if history_session_id == session_id:
+                _CHAT_HISTORY_SESSIONS.pop(key, None)
+
+
+def _touch_chat_session(session_id: str, now: Optional[float] = None) -> None:
+    """Record client activity without looking up or refreshing authentication."""
+
+    if not session_id:
+        return
+    now = time.monotonic() if now is None else now
+    with _CHAT_SESSION_LOCK:
+        lease = _UPSTREAM_SESSION_LEASES.get(session_id)
+        if lease is None:
+            return
+        lease.last_client_activity = now
+        _UPSTREAM_SESSION_LEASES.move_to_end(session_id)
+        for key, (history_session_id, _touched) in list(
+            _CHAT_HISTORY_SESSIONS.items()
+        ):
+            if history_session_id == session_id:
+                _CHAT_HISTORY_SESSIONS[key] = (session_id, now)
+                _CHAT_HISTORY_SESSIONS.move_to_end(key)
+
+
+def _capture_chat_session_auth(session_id: str, token: str) -> None:
+    """Persist the token obtained on a first turn for later continuations."""
+
+    if not session_id or not token:
+        return
+    with _CHAT_SESSION_LOCK:
+        lease = _UPSTREAM_SESSION_LEASES.get(session_id)
+        if lease is not None and not lease.auth_token:
+            lease.auth_token = token
+    _touch_chat_session(session_id)
+
+
+def _rebind_chat_session_account(
+    session_id: str,
+    account_id: str,
+    billing_id: str,
+    token: str,
+    provider_specific: Optional[Mapping[str, Any]] = None,
+) -> None:
+    """Keep the relay session lease aligned with a retry account."""
+
+    if not session_id:
+        return
+    with _CHAT_SESSION_LOCK:
+        lease = _UPSTREAM_SESSION_LEASES.get(session_id)
+        if lease is None:
+            return
+        lease.account_id = str(account_id or lease.account_id)
+        lease.billing_id = str(billing_id or lease.billing_id or lease.account_id)
+        lease.auth_token = str(token or lease.auth_token)
+        if provider_specific is not None:
+            lease.provider_specific = dict(provider_specific)
+        lease.last_client_activity = time.monotonic()
+        _UPSTREAM_SESSION_LEASES.move_to_end(session_id)
+
+
+def _begin_chat_stream(session_id: str) -> None:
+    if not session_id:
+        return
+    with _CHAT_SESSION_LOCK:
+        lease = _UPSTREAM_SESSION_LEASES.get(session_id)
+        if lease is None:
+            return
+        lease.active_streams += 1
+    _touch_chat_session(session_id)
+
+
+def _end_chat_stream(session_id: str) -> None:
+    if not session_id:
+        return
+    with _CHAT_SESSION_LOCK:
+        lease = _UPSTREAM_SESSION_LEASES.get(session_id)
+        if lease is None:
+            return
+        lease.active_streams = max(0, lease.active_streams - 1)
+    _touch_chat_session(session_id)
+
+
+async def _lease_stream(source, session_id: str):
+    """Keep the session lease alive while the API client consumes an SSE body."""
+
+    _begin_chat_stream(session_id)
+    try:
+        async for chunk in source:
+            _touch_chat_session(session_id)
+            yield chunk
+    finally:
+        _end_chat_stream(session_id)
+
+
+async def _reap_idle_chat_sessions() -> int:
+    now = time.monotonic()
+    with _CHAT_SESSION_LOCK:
+        before = len(_UPSTREAM_SESSION_LEASES)
+        _prune_chat_sessions(now)
+        return before - len(_UPSTREAM_SESSION_LEASES)
+
+
+def _bind_chat_session(
+    messages: list[dict],
+    options: dict,
+    *,
+    requested_session_id: str = "",
+    rotate_for_new: bool = True,
+) -> dict:
+    """Attach a stable upstream session and account to one API request."""
+    now = time.monotonic()
+    with _CHAT_SESSION_LOCK:
+        _prune_chat_sessions(now)
+        session_id = requested_session_id.strip()
+        inferred_account_snapshot: tuple[str, dict] | None = None
+        if not session_id and _chat_has_prior_turn(messages):
+            # Capture the currently selected account once for an inferred
+            # replay. This both makes the account comparison atomic and lets a
+            # manual account switch take effect without consulting the mutable
+            # legacy getters separately.
+            inferred_account_snapshot = auth.get_active_account_snapshot()
+            # Prefer the most specific known prefix, then fall back to the full
+            # replay for idempotent retries of the same request.
+            for length in range(len(messages), 0, -1):
+                found = _CHAT_HISTORY_SESSIONS.get(_chat_history_key(messages, length))
+                if found is not None:
+                    candidate_id = found[0]
+                    candidate_lease = _UPSTREAM_SESSION_LEASES.get(candidate_id)
+                    # A client that switched accounts and then replayed a full
+                    # OpenAI history without a relay session id must start a
+                    # fresh upstream conversation. Explicit session ids (used
+                    # by Responses continuation) bypass this branch and keep
+                    # their original credential by design.
+                    active_account = str(
+                        (inferred_account_snapshot or ("", {}))[0] or ""
+                    )
+                    if (
+                        active_account
+                        and candidate_lease is not None
+                        and candidate_lease.account_id
+                        and candidate_lease.account_id != active_account
+                    ):
+                        continue
+                    session_id = candidate_id
+                    _CHAT_HISTORY_SESSIONS.move_to_end(_chat_history_key(messages, length))
+                    break
+        if not session_id:
+            session_id = uuid_mod.uuid4().hex
+
+        lease = _UPSTREAM_SESSION_LEASES.get(session_id)
+        if lease is None:
+            if rotate_for_new and _current_upstream_mode() in (
+                "raw",
+                "direct",
+                "web",
+                "remote",
+                "9router",
+                "trae-remote",
+                "auto",
+                "ide",
+                "solo",
+                "work-agent",
+            ):
+                auth.next_polling_account()
+            # Read the selected id and its credential record as one snapshot.
+            # Separate getter calls can race an account rotation and bind an
+            # account id to a different account's token.
+            if inferred_account_snapshot is not None and not bool(
+                auth.get_polling_status().get("enabled")
+            ):
+                account_id, record = inferred_account_snapshot
+            else:
+                account_id, record = auth.get_active_account_snapshot()
+            # A disabled account may remain selected for check-in management.
+            # New sessions can select another enabled account; continuations
+            # keep their credential and are refused while it is disabled.
+            if not account_id or not auth._record_model_enabled(record):
+                account_id, record = auth.get_model_account_snapshot()
+            # Keep compatibility with integrations/tests that replace the
+            # legacy getters while still preferring the atomic snapshot in
+            # normal operation.
+            if not account_id:
+                # An account store with no eligible rows must not fall back to
+                # the management-selected (possibly disabled) credential.
+                if auth.get_accounts_raw():
+                    raise _ModelAccountUnavailable(
+                        "No enabled model account available; enable an account in "
+                        "账号与签到"
+                    )
+                account_id = auth.get_active_account_id() or ""
+            if account_id and not record:
+                record = auth.get_account_record(account_id)
+            _ensure_model_account_enabled(account_id, str(record.get("token") or ""))
+            token = str(record.get("token") or "")
+            if not token and not account_id:
+                # Preserve the CLI/env single-credential path when the
+                # account store is empty.  Once accounts are stored, an
+                # all-disabled state must fail explicitly instead of silently
+                # bypassing the per-account switch.
+                if auth.get_accounts_raw():
+                    raise _ModelAccountUnavailable(
+                        "No enabled model account available; enable an account in "
+                        "账号与签到"
+                    )
+                token = str(auth.get_token() or "")
+            billing_id = _account_id_from_token(token) or account_id
+            lease = _UpstreamSessionLease(
+                account_id=account_id,
+                billing_id=billing_id,
+                auth_token=token,
+                last_client_activity=now,
+                provider_specific=dict(
+                    record.get("provider_specific")
+                    or record.get("providerSpecificData")
+                    or {}
+                ),
+            )
+            _UPSTREAM_SESSION_LEASES[session_id] = lease
+        else:
+            # A continuation must stay on the credential captured for its first
+            # turn. Do not rotate accounts, call refresh, or mutate global auth.
+            _ensure_model_account_enabled(lease.account_id, lease.auth_token)
+            lease.last_client_activity = now
+            _UPSTREAM_SESSION_LEASES.move_to_end(session_id)
+
+        _CHAT_HISTORY_SESSIONS[_chat_history_key(messages)] = (session_id, now)
+        _CHAT_HISTORY_SESSIONS.move_to_end(_chat_history_key(messages))
+
+    bound = dict(options)
+    bound["session_id"] = session_id
+    if lease.account_id:
+        bound["_account_id"] = lease.account_id
+        if _current_upstream_mode() in ("raw", "direct", "auto"):
+            bound["_auth_user_id"] = lease.billing_id or lease.account_id
+    if lease.billing_id:
+        bound["_billing_id"] = lease.billing_id
+    if lease.auth_token:
+        bound["_auth_token"] = lease.auth_token
+    if _current_upstream_mode() != "cli":
+        # Keep account metadata pinned with the credential. The global auth
+        # state may switch before the remote request has built its headers.
+        # An explicit empty mapping prevents fallback to another account's
+        # mutable global metadata.
+        bound["provider_specific"] = dict(lease.provider_specific)
+    return bound
+
+
+def _validate_chat_options(options: dict) -> Optional[JSONResponse]:
+    """Validate the OpenAI tool surface before choosing an upstream route."""
+
+    tool_names: set[str] = set()
+    if "tools" in options:
+        tools = options["tools"]
+        if not isinstance(tools, list):
+            return _openai_error(
+                400, "tools must be an array", "invalid_request_error", "tools"
+            )
+        normalized_tools = []
+        for index, tool in enumerate(tools):
+            param = f"tools.{index}"
+            if not isinstance(tool, dict) or tool.get("type") != "function":
+                return _openai_error(
+                    400,
+                    f"{param} must be an OpenAI function tool",
+                    "invalid_request_error",
+                    param,
+                )
+            function = tool.get("function")
+            if not isinstance(function, dict):
+                # Accept the compact Responses-style flat tool shape and
+                # normalize it to the Chat-completions nested function shape.
+                function = {
+                    key: tool.get(key)
+                    for key in ("name", "description", "parameters", "strict")
+                    if key in tool
+                }
+            name = function.get("name")
+            if not isinstance(name, str) or not name.strip():
+                return _openai_error(
+                    400,
+                    f"{param}.function.name must be a non-empty string",
+                    "invalid_request_error",
+                    f"{param}.function.name",
+                )
+            if name in tool_names:
+                return _openai_error(
+                    400,
+                    f"Duplicate tool name: {name}",
+                    "invalid_request_error",
+                    f"{param}.function.name",
+                )
+            parameters = function.get("parameters")
+            if parameters is not None and not isinstance(parameters, dict):
+                return _openai_error(
+                    400,
+                    f"{param}.function.parameters must be an object",
+                    "invalid_request_error",
+                    f"{param}.function.parameters",
+                )
+            tool_names.add(name)
+            normalized_tools.append({"type": "function", "function": dict(function)})
+        if normalized_tools:
+            options["tools"] = normalized_tools
+
+    if "tool_choice" in options:
+        tool_choice = options["tool_choice"]
+        if isinstance(tool_choice, str):
+            if tool_choice not in ("none", "auto", "required"):
+                return _openai_error(
+                    400,
+                    "tool_choice must be none, auto, required, or a named function",
+                    "invalid_request_error",
+                    "tool_choice",
+                )
+            if tool_choice == "required" and not tool_names:
+                return _openai_error(
+                    400,
+                    "tool_choice=required requires at least one tool",
+                    "invalid_request_error",
+                    "tool_choice",
+                )
+        elif isinstance(tool_choice, dict):
+            function = tool_choice.get("function")
+            if not isinstance(function, dict):
+                # Accept the compact Responses-style flat tool_choice shape too.
+                function = tool_choice
+            name = function.get("name") if isinstance(function, dict) else None
+            if tool_choice.get("type") != "function" or not isinstance(name, str):
+                return _openai_error(
+                    400,
+                    "tool_choice must select a named function",
+                    "invalid_request_error",
+                    "tool_choice",
+                )
+            if name not in tool_names:
+                return _openai_error(
+                    400,
+                    f"tool_choice references undeclared tool: {name}",
+                    "invalid_request_error",
+                    "tool_choice",
+                )
+            options["tool_choice"] = {"type": "function", "function": {"name": name}}
+        else:
+            return _openai_error(
+                400,
+                "tool_choice must be a string or object",
+                "invalid_request_error",
+                "tool_choice",
+            )
+
+    if "parallel_tool_calls" in options and not isinstance(
+        options["parallel_tool_calls"], bool
+    ):
+        return _openai_error(
+            400,
+            "parallel_tool_calls must be a boolean",
+            "invalid_request_error",
+            "parallel_tool_calls",
+        )
+
+    for key in ("client_context", "clientContext"):
+        if key in options and not isinstance(options[key], dict):
+            return _openai_error(
+                400,
+                f"{key} must be an object",
+                "invalid_request_error",
+                key,
+            )
+
+    alias_pairs = (
+        ("client_context", "clientContext"),
+        ("session_id", "sessionId"),
+        ("max_tokens", "maxTokens"),
+    )
+    for canonical, alias in alias_pairs:
+        if canonical in options and alias in options and options[canonical] != options[alias]:
+            return _openai_error(
+                400,
+                f"{canonical} and {alias} must not conflict",
+                "invalid_request_error",
+                canonical,
+            )
+
+    for key in ("session_id", "sessionId"):
+        if key in options:
+            value = options[key]
+            if (
+                not isinstance(value, str)
+                or not value.strip()
+                or len(value) > 256
+                or "\x00" in value
+            ):
+                return _openai_error(
+                    400,
+                    f"{key} must be a non-empty string of at most 256 characters",
+                    "invalid_request_error",
+                    key,
+                )
+
+    for key in ("max_tokens", "maxTokens", "max_completion_tokens"):
+        if key in options:
+            value = options[key]
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                return _openai_error(
+                    400,
+                    f"{key} must be a positive integer",
+                    "invalid_request_error",
+                    key,
+                )
+    return None
+
+
+def _number_value(value: Any) -> int | float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(value, (int, float)):
+        return None
+    return max(0, value)
+
+
+
+def _credit_round(value: int | float | None) -> int | float | None:
+    """Round credit values to 2 decimal places for consistent display."""
+    if value is None:
+        return None
+    try:
+        return round(float(value), 2)
+    except (TypeError, ValueError):
+        return None
+
+def _first_number(data: Mapping[str, Any], *keys: str) -> int | float | None:
+    for key in keys:
+        value = _number_value(data.get(key))
+        if value is not None:
+            return value
+        # A few native adapters serialize accounting numbers as strings.
+        raw = data.get(key)
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = float(raw.strip())
+            except (TypeError, ValueError):
+                parsed = None
+            if parsed is not None and parsed >= 0:
+                return parsed
+    return None
+
+
+def _nested_credit_value(value: Any, depth: int = 0) -> int | float | None:
+    """Find an explicit credit field without mistaking tokens or money for it."""
+
+    if depth > 6:
+        return None
+    keys = (
+        "credits_consumed",
+        "consumed_credits",
+        "credit_cost",
+        "credits_cost",
+        "credits_float",
+        "creditsFloat",
+        "amount_float",
+        "amountFloat",
+    )
+    if isinstance(value, Mapping):
+        for key in keys:
+            if key in value:
+                candidate = _first_number(value, key)
+                if candidate is not None:
+                    return candidate
+        preferred = (
+            "user_usage_group_by_session",
+            "userUsageGroupBySession",
+            "usage",
+            "billing",
+            "cost",
+            "response_meta",
+            "responseMeta",
+            "data",
+        )
+        for key in preferred:
+            if key in value:
+                candidate = _nested_credit_value(value.get(key), depth + 1)
+                if candidate is not None:
+                    return candidate
+        for child in value.values():
+            candidate = _nested_credit_value(child, depth + 1)
+            if candidate is not None:
+                return candidate
+    elif isinstance(value, list):
+        for child in value:
+            candidate = _nested_credit_value(child, depth + 1)
+            if candidate is not None:
+                return candidate
+    return None
+
+
+def _usage_values(usage: Any) -> dict[str, Any]:
+    if not isinstance(usage, Mapping):
+        return {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "cached_tokens": 0,
+            "credits_consumed": None,
+        }
+    prompt = _first_number(
+        usage, "prompt_tokens", "input_tokens", "input_token", "inputTokens"
+    ) or 0
+    completion = _first_number(
+        usage,
+        "completion_tokens",
+        "output_tokens",
+        "output_token",
+        "outputTokens",
+    ) or 0
+    total = _first_number(usage, "total_tokens", "total_token", "totalTokens")
+    if total is None:
+        total = prompt + completion
+    credits = _nested_credit_value(usage)
+    cached = _first_number(
+        usage,
+        "cached_tokens",
+        "cache_read_tokens",
+        "cacheReadTokens",
+        "cachedTokens",
+        "cache_read_input_tokens",
+    )
+    for details_key in ("prompt_tokens_details", "input_tokens_details"):
+        details = usage.get(details_key)
+        if cached is None and isinstance(details, Mapping):
+            cached = _first_number(details, "cached_tokens", "cache_read_tokens")
+    return {
+        "prompt_tokens": int(prompt),
+        "completion_tokens": int(completion),
+        "total_tokens": int(total),
+        "cached_tokens": int(cached or 0),
+        "credits_consumed": credits,
+    }
+
+
+def _optional_bool(value: Any) -> bool | None:
+    """Normalize persisted/request metadata without guessing missing values."""
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on", "enabled", "是", "有"}:
+            return True
+        if normalized in {"0", "false", "no", "off", "disabled", "否", "无"}:
+            return False
+    return None
+
+
+def _context_mode_bool(value: Any) -> bool | None:
+    """Map known context labels to a Max-enabled boolean.
+
+    Unknown labels stay ``None`` instead of being guessed as standard.  This
+    matters when normalizing old records written by a custom adapter.
+    """
+
+    if value in (None, ""):
+        return None
+    normalized = str(value).strip().lower().replace("-", "_").replace(" ", "")
+    if normalized in {"max", "max_1m", "max1m", "1m", "1000000", "agent_max", "max_mode"}:
+        return True
+    if normalized in {
+        "standard",
+        "default",
+        "work",
+        "dev",
+        "200k",
+        "200000",
+        "normal",
+    }:
+        return False
+    return None
+
+
+def _option_flag(value: Any) -> bool:
+    """Return a strict truth value for request flags."""
+
+    return _optional_bool(value) is True
+
+
+def _tool_catalog_has_entries(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        return bool(value)
+    if isinstance(value, (list, tuple, set)):
+        return bool(value)
+    return value not in (None, "", False)
+
+
+def _tools_requested_from_options(options: Optional[Mapping[str, Any]]) -> bool:
+    """Whether this request carries a caller tool protocol.
+
+    ``_tool_protocol_requested`` can also be set for a continuation that only
+    carries tool history.  An explicit ``tools=[]`` remains false unless an
+    inherited catalog or a tool choice says otherwise.
+    """
+
+    options = options or {}
+    # An explicit catalog, including ``tools=[]``, owns this turn.  Do not
+    # revive a previous Responses catalog from ``_inherited_tools`` when the
+    # caller intentionally supplied an empty tools array.
+    if "tools" in options:
+        return _tool_catalog_has_entries(options.get("tools"))
+    if _tool_catalog_has_entries(options.get("_inherited_tools")):
+        return True
+    if "_inherited_tools" not in options:
+        if _option_flag(options.get("_tool_protocol_requested")):
+            return True
+    choice = options.get("tool_choice")
+    if choice not in (None, "", "none", False):
+        return True
+    return False
+
+
+def _requested_reasoning_effort(options: Optional[Mapping[str, Any]]) -> str | None:
+    """Extract the caller-facing thinking strength without normalizing labels."""
+
+    options = options or {}
+    for key in ("reasoning_effort", "reasoningEffort", "thinking_effort"):
+        value = options.get(key)
+        if value not in (None, ""):
+            return str(value).strip() or None
+    reasoning = options.get("reasoning")
+    if isinstance(reasoning, Mapping):
+        value = reasoning.get("effort") or reasoning.get("level")
+        if value not in (None, ""):
+            return str(value).strip() or None
+    thinking = options.get("thinking")
+    if isinstance(thinking, Mapping):
+        value = (
+            thinking.get("effort")
+            or thinking.get("level")
+            or thinking.get("budget_tokens")
+            or thinking.get("budgetTokens")
+        )
+        if value not in (None, ""):
+            return str(value).strip() or None
+        if _option_flag(thinking.get("enabled")) or _option_flag(thinking.get("enable")):
+            return "enabled"
+    elif thinking not in (None, "", False):
+        return "enabled"
+    return None
+
+
+def _context_mode_metadata(
+    options: Optional[Mapping[str, Any]],
+) -> tuple[str | None, str | None, int | float | None, bool | None]:
+    """Return requested/actual context mode and its known token window."""
+
+    options = options or {}
+    trace = options.get("_upstream_trace")
+    trace = trace if isinstance(trace, Mapping) else {}
+    if "trae_max_mode" in options:
+        requested_max = _option_flag(options["trae_max_mode"])
+    elif "max_mode" in options:
+        requested_max = _option_flag(options["max_mode"])
+    else:
+        requested_max = bool(auth.get_max_mode_settings().get("enabled"))
+    applied_marker = trace.get("max_mode_applied") if "max_mode_applied" in trace else None
+    applied_max = _optional_bool(applied_marker)
+    requested = "max_1m" if requested_max else "standard"
+    actual = (
+        "max_1m"
+        if applied_max is True
+        else "standard"
+        if applied_max is False
+        # A request that explicitly/defaults to standard has no separate
+        # upstream max acknowledgement to wait for.  Keep ordinary requests
+        # useful in the console while preserving "unknown" for a requested
+        # Max turn whose upstream trace never confirmed the mode.
+        else "standard"
+        if not requested_max
+        else None
+    )
+    window = _number_value(trace.get("max_context_tokens"))
+    if window is None and applied_max is True:
+        window = 1_000_000
+    return requested, actual, window, applied_max
+
+
+def _tool_call_count(value: Any) -> int:
+    """Count structured tool calls in one translated model payload."""
+
+    if not isinstance(value, Mapping):
+        return 0
+    value_type = str(value.get("type") or "").strip().lower()
+    if value_type in {
+        "function_call",
+        "custom_tool_call",
+        "tool_call",
+        "tool_use",
+    }:
+        return 1
+    count = 0
+    calls = value.get("tool_calls")
+    if isinstance(calls, list):
+        count += sum(1 for item in calls if isinstance(item, Mapping))
+    elif isinstance(calls, Mapping):
+        count += 1
+    if isinstance(value.get("function_call"), Mapping):
+        count += 1
+    for key in ("message", "delta", "output", "response", "item", "items", "content"):
+        nested = value.get(key)
+        if isinstance(nested, Mapping):
+            count += _tool_call_count(nested)
+        elif isinstance(nested, list):
+            count += sum(_tool_call_count(item) for item in nested)
+    choices = value.get("choices")
+    if isinstance(choices, list):
+        count += sum(_tool_call_count(item) for item in choices)
+    return count
+
+
+def _request_account_identity() -> tuple[str, str]:
+    token = auth.get_token() or ""
+    token_identity = _account_id_from_token(token)
+    if token_identity:
+        return token_identity, token
+    account_id = (
+        auth.get_active_account_id()
+        or auth.get_user_id()
+        or token[:16]
+        or "default"
+    )
+    return str(account_id), token
+
+
+def _account_id_from_token(token: str) -> str:
+    """Extract the immutable Trae account id carried by a JWT, if present."""
+
+    raw_token = str(token or "").strip()
+    if not raw_token:
+        return ""
+    try:
+        parts = raw_token.split(".")
+        if len(parts) < 2:
+            return ""
+        encoded = parts[1] + "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(encoded.encode("ascii")))
+    except (ValueError, TypeError, UnicodeError, binascii.Error, json.JSONDecodeError):
+        return ""
+    if not isinstance(payload, Mapping):
+        return ""
+    data = payload.get("data")
+    if isinstance(data, Mapping):
+        for key in ("id", "user_id", "userId", "sub"):
+            value = data.get(key)
+            if value not in (None, ""):
+                return str(value)
+    for key in ("user_id", "userId", "sub"):
+        value = payload.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
+async def _fetch_used_credits(token: str) -> int | float | None:
+    if not token:
+        return None
+    try:
+        raw = await trae_client.fetch_account_total_credits(token)
+        parsed = trae_client.parse_account_credits(raw)
+        return _number_value(parsed.get("used"))
+    except Exception as exc:
+        logger.debug("usage credit snapshot unavailable: %s", exc)
+        return None
+
+
+def _begin_credit_snapshot(account_id: str, token: str) -> bool:
+    if not account_id or account_id == "default" or not token:
+        return False
+    with _USAGE_LOCK:
+        active = _USAGE_ACTIVE_ACCOUNTS.get(account_id, 0)
+        if active:
+            _USAGE_UNSAFE_ACCOUNTS.add(account_id)
+        _USAGE_ACTIVE_ACCOUNTS[account_id] = active + 1
+        # A delta is only attributable when this account has one request in
+        # flight. Concurrent calls share the same upstream counter.
+        return active == 0
+
+
+def _end_credit_snapshot(account_id: str) -> None:
+    if not account_id:
+        return
+    with _USAGE_LOCK:
+        active = _USAGE_ACTIVE_ACCOUNTS.get(account_id, 0)
+        if active <= 1:
+            _USAGE_ACTIVE_ACCOUNTS.pop(account_id, None)
+            _USAGE_UNSAFE_ACCOUNTS.discard(account_id)
+        else:
+            _USAGE_ACTIVE_ACCOUNTS[account_id] = active - 1
+
+
+def _credit_snapshot_is_safe(account_id: str) -> bool:
+    with _USAGE_LOCK:
+        return account_id not in _USAGE_UNSAFE_ACCOUNTS
+
+
+def _usage_account_token(account_id: str) -> str:
+    """Resolve a persisted row to the credential that owns its bill.
+
+    The account store may be keyed by a local user id while usage rows carry
+    the immutable JWT subject (or the reverse), especially after polling or
+    token refresh. Match both forms before abandoning a recoverable row.
+    """
+
+    identity = str(account_id or "").strip()
+    if not identity:
+        return ""
+    direct = auth.get_account_record(identity)
+    token = str((direct or {}).get("token") or "").strip()
+    if token:
+        return token
+    for stored_id, record in auth.get_accounts_raw():
+        record = record if isinstance(record, Mapping) else {}
+        candidate = str(record.get("token") or "").strip()
+        if not candidate:
+            continue
+        if (
+            str(stored_id or "") == identity
+            or str(record.get("user_id") or "") == identity
+            or _account_id_from_token(candidate) == identity
+        ):
+            return candidate
+    return ""
+
+
+def _usage_enrich_concurrency() -> int:
+    try:
+        value = int(os.environ.get("TRAE_USAGE_ENRICH_CONCURRENCY", "8") or "8")
+    except (TypeError, ValueError):
+        value = 8
+    return max(1, min(value, 64))
+
+
+def _spawn_usage_task(
+    coro,
+    registry: set[asyncio.Task] | None = None,
+) -> asyncio.Task | None:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # A few management/test paths construct a tracker synchronously.
+        # Close the coroutine we were handed so it cannot leak a
+        # ``was never awaited`` warning; real request paths always have a
+        # running loop and continue to schedule normally.
+        close = getattr(coro, "close", None)
+        if callable(close):
+            close()
+        return None
+    registry = registry if registry is not None else _USAGE_ENRICH_TASKS
+    task = asyncio.create_task(coro)
+    registry.add(task)
+
+    def done(completed: asyncio.Task) -> None:
+        registry.discard(completed)
+        try:
+            completed.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.debug("usage enrichment failed: %s", exc)
+
+    task.add_done_callback(done)
+    return task
+
+
+def _schedule_pending_usage_enrichment() -> int:
+    """Resume bill lookups for persisted rows after a relay restart."""
+
+    async def enrich_pending(
+        record: Mapping[str, Any], token: str, semaphore: asyncio.Semaphore
+    ) -> None:
+        # A restart-resumed lookup never acquired a live account snapshot.
+        # Keep it bounded so a large history cannot burst the usage endpoint.
+        request_id = str(record.get("request_id") or "")
+        try:
+            async with semaphore:
+                await _enrich_usage_credits(
+                    request_id,
+                    str(record.get("account_id") or ""),
+                    token,
+                    None,
+                    usage_turn_id=str(record.get("usage_turn_id") or ""),
+                    credit_safe=False,
+                    release_snapshot=False,
+                )
+        finally:
+            # Cancellation while waiting for the semaphore bypasses the
+            # enrichment coroutine's own cleanup.
+            _USAGE_PENDING_TASK_IDS.discard(request_id)
+
+    scheduled = 0
+    with _USAGE_LOCK:
+        pending = [
+            dict(record)
+            for record in _USAGE_HISTORY
+            if _number_value(record.get("credits_consumed")) is None
+            and record.get("usage_turn_id")
+            and record.get("request_id")
+        ]
+    concurrency_limit = _usage_enrich_concurrency()
+    semaphore = asyncio.Semaphore(concurrency_limit)
+    for record in pending:
+        request_id = str(record.get("request_id") or "")
+        if not request_id or request_id in _USAGE_PENDING_TASK_IDS:
+            continue
+        account_id = str(record.get("account_id") or "")
+        token = _usage_account_token(account_id)
+        if not token:
+            continue
+        _USAGE_PENDING_TASK_IDS.add(request_id)
+        _spawn_usage_task(enrich_pending(record, token, semaphore))
+        scheduled += 1
+    if scheduled:
+        logger.info(
+            "scheduled %d pending usage credit lookup(s) concurrency=%d",
+            scheduled,
+            concurrency_limit,
+        )
+    return scheduled
+
+
+async def _cancel_usage_task(
+    task: asyncio.Task | None,
+    registry: set[asyncio.Task] | None = None,
+) -> None:
+    """Cancel and drain one background usage task without leaking exceptions."""
+    if task is None:
+        return
+    try:
+        if not task.done():
+            task.cancel()
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:
+        logger.debug("usage background task stopped with error: %s", exc)
+    finally:
+        if registry is not None:
+            registry.discard(task)
+
+
+async def _cancel_usage_tasks() -> None:
+    """Cancel and await all usage enrichment/snapshot tasks during shutdown."""
+    tasks = set(_USAGE_ENRICH_TASKS) | set(_USAGE_SNAPSHOT_TASKS)
+    if not tasks:
+        _USAGE_PENDING_TASK_IDS.clear()
+        return
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    _USAGE_ENRICH_TASKS.difference_update(tasks)
+    _USAGE_SNAPSHOT_TASKS.difference_update(tasks)
+    _USAGE_PENDING_TASK_IDS.clear()
+
+
+def _usage_credit_retry_delays() -> tuple[float, ...]:
+    """Return short delays used while a just-finished turn settles upstream."""
+
+    explicit = os.environ.get("TRAE_USAGE_CREDIT_RETRY_DELAYS")
+    if explicit:
+        values: list[float] = []
+        for item in str(explicit).split(","):
+            try:
+                values.append(max(0.0, min(float(item.strip()), 30.0)))
+            except (TypeError, ValueError):
+                continue
+        if values:
+            return tuple(values)
+    attempts = _session_usage_query_attempts()
+    base = _session_usage_query_delay()
+    return tuple(
+        0.0 if index == 0 else min(30.0, base * (2 ** (index - 1)))
+        for index in range(attempts)
+    )
+
+
+async def _enrich_usage_credits(
+    request_id: str,
+    account_id: str,
+    token: str,
+    before_task: asyncio.Task | None,
+    *,
+    usage_turn_id: str = "",
+    credit_safe: bool = True,
+    release_snapshot: bool = True,
+) -> None:
+    if request_id:
+        _USAGE_PENDING_TASK_IDS.add(request_id)
+    try:
+        settle = _credit_settle_seconds()
+        if settle:
+            await asyncio.sleep(settle)
+        if usage_turn_id and _session_usage_enabled():
+            for attempt, delay in enumerate(_usage_credit_retry_delays()):
+                if attempt and delay:
+                    await asyncio.sleep(delay)
+                try:
+                    session_usage = await trae_client.fetch_session_usage(
+                        usage_turn_id,
+                        token,
+                    )
+                    credits = _number_value(
+                        session_usage.get("credits_consumed")
+                        if isinstance(session_usage, Mapping)
+                        else None
+                    )
+                    # Zero is a valid settled charge. Only None means that
+                    # the commercial endpoint has not produced a bill yet.
+                    if credits is not None and credits >= 0:
+                        await _cancel_usage_task(
+                            before_task,
+                            _USAGE_SNAPSHOT_TASKS,
+                        )
+                        before_task = None
+                        _update_usage_record(
+                            request_id,
+                            credits_consumed=_credit_round(credits),
+                            credits_source="session_usage",
+                        )
+                        return
+                    logger.debug(
+                        "session usage not settled request=%s attempt=%d",
+                        request_id,
+                        attempt + 1,
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "session usage enrichment unavailable request=%s attempt=%d: %s",
+                        request_id,
+                        attempt + 1,
+                        exc,
+                    )
+        if not credit_safe or not _credit_snapshot_is_safe(account_id):
+            return
+        before = None
+        if before_task is not None:
+            try:
+                before = await before_task
+            except Exception:
+                before = None
+        after = await _fetch_used_credits(token)
+        if before is None or after is None or after < before:
+            return
+        _update_usage_record(
+            request_id,
+            credits_consumed=_credit_round(after - before),
+            credits_source="snapshot_delta",
+            credits_before=_credit_round(before),
+            credits_after=_credit_round(after),
+        )
+    finally:
+        if request_id:
+            _USAGE_PENDING_TASK_IDS.discard(request_id)
+        await _cancel_usage_task(before_task, _USAGE_SNAPSHOT_TASKS)
+        if release_snapshot:
+            _end_credit_snapshot(account_id)
+
+
+class _UsageTracker:
+    def __init__(
+        self,
+        model: str,
+        endpoint: str,
+        stream: bool,
+        options: Optional[Mapping[str, Any]] = None,
+        messages: Optional[list[dict[str, Any]]] = None,
+    ):
+        self.request_id = "req-" + uuid_mod.uuid4().hex
+        options = options if isinstance(options, dict) else dict(options or {})
+        if not isinstance(options.get("_upstream_trace"), dict):
+            options["_upstream_trace"] = {}
+        self.options = options
+        self.messages = messages or []
+        self.account_id = str(options.get("_account_id") or "")
+        self.billing_id = str(options.get("_billing_id") or "")
+        self.token = str(options.get("_auth_token") or "")
+        if self.account_id and not self.token:
+            # An explicitly bound account owns the lookup.  Never fill its
+            # token from the mutable global auth state.
+            record = auth.get_account_record(self.account_id)
+            self.token = str(record.get("token") or "")
+        token_identity = _account_id_from_token(self.token)
+        if token_identity:
+            # The JWT is the credential that the upstream actually bills. It
+            # is authoritative over a stale UI-selected account id.
+            if self.account_id and self.account_id != token_identity:
+                logger.warning(
+                    "usage account corrected from bound id=%s to token id=%s",
+                    self.account_id,
+                    token_identity,
+                )
+            self.account_id = token_identity
+        if self.billing_id:
+            # billing_id overrides account_id for usage records so the
+            # deducted credits are attributed to the token owner.
+            self.account_id = self.billing_id
+        if not self.account_id or not self.token:
+            fallback_account_id, fallback_token = _request_account_identity()
+            self.account_id = self.account_id or fallback_account_id
+            self.token = self.token or fallback_token
+        self.model = model
+        self.endpoint = endpoint
+        self.stream = bool(stream)
+        self.started = time.perf_counter()
+        self.usage = _usage_values({})
+        self.usage_turn_id = ""
+        self.saw_usage = False
+        # Request metadata is captured before dispatch; the trace and tool
+        # return state are updated later as the selected upstream responds.
+        self.reasoning_effort = _requested_reasoning_effort(options)
+        (
+            self.context_mode_requested,
+            self.context_mode_actual,
+            self.context_window_tokens,
+            self.max_mode_applied,
+        ) = _context_mode_metadata(options)
+        # Keep request capability and model behaviour separate.  A non-empty
+        # ``tools`` catalog means the caller offered tools; it does not mean
+        # that this response actually returned a tool call.
+        self.tools_requested = _tools_requested_from_options(options)
+        self.tool_used: bool | None = None
+        self.tool_calls_returned: bool | None = None
+        self.status = "in_progress"
+        self._finished = False
+        self._credit_snapshot_started = bool(
+            self.account_id and self.account_id != "default" and self.token
+        )
+        self._credit_safe = _begin_credit_snapshot(self.account_id, self.token)
+        self._before_task = (
+            _spawn_usage_task(
+                _fetch_used_credits(self.token),
+                _USAGE_SNAPSHOT_TASKS,
+            )
+            if self._credit_safe
+            else None
+        )
+
+    def update(self, usage: Any) -> None:
+        self.saw_usage = True
+        values = _usage_values(usage)
+        # Upstream streams may send cumulative usage more than once. Keep the
+        # latest complete token snapshot instead of creating duplicate records.
+        # A later token-only frame must not erase explicit credit evidence
+        # reported by an earlier frame.
+        if values["total_tokens"] >= self.usage["total_tokens"]:
+            explicit_credits = self.usage.get("credits_consumed")
+            self.usage.update(values)
+            if (
+                values.get("credits_consumed") is None
+                and explicit_credits is not None
+            ):
+                self.usage["credits_consumed"] = explicit_credits
+        elif values.get("credits_consumed") is not None:
+            self.usage["credits_consumed"] = values["credits_consumed"]
+
+    def mark_tool_calls(self, value: Any) -> None:
+        """Record whether the model actually returned a structured tool call."""
+
+        if value is None:
+            return
+        has_calls = (
+            _tool_call_count(value) > 0
+            if isinstance(value, Mapping)
+            else bool(value)
+        )
+        if has_calls:
+            self.tool_calls_returned = True
+
+    def bind_usage_turn(self, usage_turn_id: Any, *, replace: bool = False) -> None:
+        value = str(usage_turn_id or "").strip()
+        if value and (replace or not self.usage_turn_id):
+            self.usage_turn_id = value
+
+    async def rebind(self, options: Optional[Mapping[str, Any]] = None) -> None:
+        """Move billing/credit tracking to the account used by a retry.
+
+        Remote account rotation can happen after the tracker has started its
+        before-credit snapshot.  Cancel that snapshot and restart it for the
+        new JWT so the eventual usage row and credit delta follow the account
+        that actually handled the request.
+        """
+        options = options or {}
+        token = str(options.get("_auth_token") or "").strip()
+        account_id = str(options.get("_account_id") or "").strip()
+        billing_id = str(options.get("_billing_id") or "").strip()
+        token_identity = _account_id_from_token(token)
+        if token_identity:
+            billing_id = token_identity
+            account_id = token_identity
+        elif billing_id:
+            account_id = billing_id
+        if not account_id and token:
+            account_id = str(auth.get_active_account_id() or "default")
+        if not token and account_id:
+            token = str((auth.get_account_record(account_id) or {}).get("token") or "").strip()
+        if not account_id and not token:
+            return
+        if account_id == self.account_id and token == self.token:
+            return
+
+        old_account = self.account_id
+        await _cancel_usage_task(self._before_task, _USAGE_SNAPSHOT_TASKS)
+        self._before_task = None
+        if self._credit_snapshot_started:
+            _end_credit_snapshot(old_account)
+
+        self.account_id = account_id or self.account_id
+        self.billing_id = billing_id or self.account_id
+        self.token = token or self.token
+        self.usage_turn_id = ""
+        self._credit_snapshot_started = bool(
+            self.account_id and self.account_id != "default" and self.token
+        )
+        self._credit_safe = _begin_credit_snapshot(self.account_id, self.token)
+        if self._credit_safe:
+            self._before_task = _spawn_usage_task(
+                _fetch_used_credits(self.token),
+                _USAGE_SNAPSHOT_TASKS,
+            )
+
+    async def finish(self, status: str | None = None) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        final_status = status or self.status or "completed"
+        values = self.usage
+        trace = self.options.get("_upstream_trace")
+        trace = trace if isinstance(trace, Mapping) else {}
+        requested_effort = _requested_reasoning_effort(self.options)
+        if requested_effort:
+            self.reasoning_effort = requested_effort
+        applied_effort = (
+            trace.get("reasoning_effort_applied")
+            or self.options.get("_reasoning_effort_applied")
+        )
+        (
+            context_requested,
+            context_actual,
+            context_window,
+            max_applied,
+        ) = _context_mode_metadata(self.options)
+        self.context_mode_requested = context_requested or self.context_mode_requested
+        self.context_mode_actual = context_actual or self.context_mode_actual
+        self.context_window_tokens = context_window or self.context_window_tokens
+        self.max_mode_applied = (
+            max_applied
+            if max_applied is not None
+            else self.max_mode_applied
+        )
+        if self.tool_calls_returned is None and final_status == "completed":
+            # A completed turn with an offered tool catalog and no structured
+            # call is an explicit negative result.  Failed/cancelled turns
+            # remain unknown because no terminal model decision was observed.
+            self.tool_calls_returned = False
+        if final_status == "completed":
+            self.tool_used = self.tool_calls_returned is True
+        else:
+            self.tool_used = self.tool_calls_returned
+        context_mode = self.context_mode_actual
+        explicit_credits = values.get("credits_consumed")
+        credits_source = (
+            "upstream"
+            if explicit_credits is not None
+            else "pending"
+            if self.usage_turn_id or self._credit_safe
+            else "unknown"
+        )
+        _record_usage(
+            self.account_id,
+            self.model,
+            values["prompt_tokens"],
+            values["completion_tokens"],
+            credits_consumed=explicit_credits,
+            credits_source=credits_source,
+            usage_turn_id=self.usage_turn_id or None,
+            request_id=self.request_id,
+            endpoint=self.endpoint,
+            stream=self.stream,
+            status=final_status,
+            duration_ms=round((time.perf_counter() - self.started) * 1000, 1),
+            tokens_source="upstream" if self.saw_usage else "unknown",
+            cached_tokens=values.get("cached_tokens", 0),
+            reasoning_effort=self.reasoning_effort,
+            requested_reasoning_effort=self.reasoning_effort,
+            reasoning_effort_applied=(
+                str(applied_effort).strip()
+                if applied_effort not in (None, "")
+                else None
+            ),
+            context_mode_requested=self.context_mode_requested,
+            context_mode=context_mode,
+            context_mode_actual=self.context_mode_actual,
+            context_window_tokens=self.context_window_tokens,
+            max_mode_applied=self.max_mode_applied,
+            max_mode_requested=self.context_mode_requested == "max_1m",
+            max_mode_enabled=self.max_mode_applied,
+            tools_requested=self.tools_requested,
+            tool_used=self.tool_used,
+            tool_calls_returned=self.tool_calls_returned,
+            tool_called=self.tool_used,
+        )
+        if explicit_credits is not None:
+            try:
+                await _cancel_usage_task(self._before_task, _USAGE_SNAPSHOT_TASKS)
+            finally:
+                self._before_task = None
+                if self._credit_snapshot_started:
+                    _end_credit_snapshot(self.account_id)
+        elif self.usage_turn_id or self._credit_safe:
+            _spawn_usage_task(
+                _enrich_usage_credits(
+                    self.request_id,
+                    self.account_id,
+                    self.token,
+                    self._before_task,
+                    usage_turn_id=self.usage_turn_id,
+                    credit_safe=self._credit_safe,
+                    release_snapshot=self._credit_snapshot_started,
+                )
+            )
+        else:
+            try:
+                await _cancel_usage_task(self._before_task, _USAGE_SNAPSHOT_TASKS)
+            finally:
+                self._before_task = None
+                if self._credit_snapshot_started:
+                    _end_credit_snapshot(self.account_id)
+
+    async def begin(self) -> None:
+        if self._before_task is not None:
+            # Let the before-snapshot request start without delaying the first
+            # model frame on the result of a separate billing endpoint.
+            await asyncio.sleep(0)
+
+
+def _track_usage_from_result(result: dict, model: str) -> None:
+    """Pass non-stream usage to the request tracker, or keep legacy fallback."""
+    usage = result.get("usage") or {}
+    tracker = _USAGE_TRACKER.get()
+    if tracker is not None:
+        mark_tool_calls = getattr(tracker, "mark_tool_calls", None)
+        if callable(mark_tool_calls):
+            mark_tool_calls(result)
+        tracker.update(usage)
+        return
+    values = _usage_values(usage)
+    account_id, _ = _request_account_identity()
+    _record_usage(
+        account_id,
+        model,
+        values["prompt_tokens"],
+        values["completion_tokens"],
+        credits_consumed=values.get("credits_consumed"),
+        credits_source="upstream" if values.get("credits_consumed") is not None else "unknown",
+        cached_tokens=values.get("cached_tokens", 0),
+    )
+
+
+def _track_usage_from_exception(exc: BaseException, model: str) -> None:
+    usage = getattr(exc, "usage", None)
+    if usage is not None and not getattr(exc, "_relay_usage_recorded", False):
+        _track_usage_from_result({"usage": usage}, model)
+        exc._relay_usage_recorded = True
+
+
+def _track_usage_from_chunk(chunk: str, model: str) -> None:
+    """Pass OpenAI and TraeWork SSE usage to the request tracker.
+
+    Ordinary relay streams put usage on a ``data:`` JSON frame. The TraeWork
+    custom-model adapter wraps the same payload as ``event: token_usage``.
+    Parse complete SSE blocks instead of requiring a chunk to start with
+    ``data:``; an ASGI chunk may contain several events.
+    """
+    if isinstance(chunk, (bytes, bytearray)):
+        text = bytes(chunk).decode("utf-8", errors="replace")
+    else:
+        text = str(chunk or "")
+    if not text:
+        return
+
+    tracker = _USAGE_TRACKER.get()
+    normalized = text.replace("\r\n", "\n")
+    for block in normalized.split("\n\n"):
+        if not block.strip():
+            continue
+        event_name = ""
+        data_lines: list[str] = []
+        for line in block.split("\n"):
+            stripped = line.strip()
+            if stripped.lower().startswith("event:"):
+                event_name = stripped.split(":", 1)[1].strip().lower()
+            elif stripped.lower().startswith("data:"):
+                data_lines.append(stripped.split(":", 1)[1].lstrip())
+        if not data_lines:
+            continue
+        payload_text = "\n".join(data_lines).strip()
+        if payload_text == "[DONE]":
+            continue
+        try:
+            data = json.loads(payload_text)
+        except Exception:
+            continue
+        if not isinstance(data, Mapping):
+            continue
+        if tracker is not None:
+            mark_tool_calls = getattr(tracker, "mark_tool_calls", None)
+            if callable(mark_tool_calls):
+                mark_tool_calls(data)
+        usage = data.get("usage")
+        if not usage and event_name == "token_usage":
+            usage = data
+        if not isinstance(usage, Mapping):
+            continue
+        if tracker is not None:
+            update = getattr(tracker, "update", None)
+            if callable(update):
+                update(usage)
+            # Test/dummy trackers may only expose ``saw_usage``; they already
+            # own their terminal bookkeeping and should not create a second
+            # fallback usage row here.
+            continue
+        values = _usage_values(usage)
+        account_id, _ = _request_account_identity()
+        _record_usage(
+            account_id,
+            model,
+            values["prompt_tokens"],
+            values["completion_tokens"],
+            credits_consumed=values.get("credits_consumed"),
+            credits_source="upstream" if values.get("credits_consumed") is not None else "unknown",
+            cached_tokens=values.get("cached_tokens", 0),
+        )
+
+
+def _bind_usage_turn(usage_turn_id: Any, *, replace: bool = False) -> None:
+    tracker = _USAGE_TRACKER.get()
+    if tracker is not None:
+        tracker.bind_usage_turn(usage_turn_id, replace=replace)
+
+
+def _bind_usage_turn_from_metadata(metadata: Any) -> None:
+    if isinstance(metadata, Mapping):
+        _bind_usage_turn(metadata.get("usage_turn_id"))
+
+
+def _remote_only_models() -> set[str]:
+    """Return explicit overrides for remote manual selection."""
+    raw = os.environ.get("TRAE_REMOTE_ONLY_MODELS", "")
+    configured: set[str] = set()
+    for item in raw.split(","):
+        value = item.strip().lower()
+        if value.startswith("trae/"):
+            value = value[5:]
+        if value:
+            configured.add(value)
+    return configured
+
+
+def _raw_history_limit_int(
+    options: Mapping[str, Any],
+    names: tuple[str, ...],
+    env_name: str,
+    default: int,
+) -> int:
+    value = None
+    for name in names:
+        value = options.get(name)
+        if value is not None:
+            break
+    if value is None:
+        value = os.environ.get(env_name, str(default))
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _bounded_remote_query(
+    messages: list[Mapping[str, Any]],
+    options: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], int]:
+    """Truncate oldest non-system messages so the flattened query fits upstream.
+
+    Trae's remote session silently ends the event stream (no text, no ``done``)
+    when initial_message.query exceeds roughly 500k chars.  Keep the system
+    prompt and the newest turns intact and drop the oldest conversation from
+    the front until ``flatten_query`` is under the configured cap.
+    """
+
+    raw_limit = _raw_history_limit_int(
+        options,
+        ("trae_remote_query_max_chars", "traeRemoteQueryMaxChars"),
+        "TRAE_REMOTE_QUERY_MAX_CHARS",
+        480_000,
+    )
+    if raw_limit <= 0:
+        return [dict(m) for m in messages], 0
+    bounded = [dict(m) for m in messages]
+    removed = 0
+    while True:
+        query = trae_client.flatten_query(bounded)
+        if len(query) <= raw_limit:
+            return bounded, removed
+        non_system = [
+            index
+            for index, message in enumerate(bounded)
+            if str(message.get("role") or "user") not in {"system", "developer"}
+        ]
+        if len(non_system) <= 1:
+            return bounded, removed
+        head = non_system[0]
+        drop = {head}
+        head_message = bounded[head]
+        if str(head_message.get("role") or "") == "assistant" and (
+            head_message.get("tool_calls") or head_message.get("function_call")
+        ):
+            if head + 1 < len(bounded):
+                following = bounded[head + 1]
+                if str(following.get("role") or "") == "tool":
+                    drop.add(head + 1)
+        bounded = [m for index, m in enumerate(bounded) if index not in drop]
+        removed += len(drop)
+
+
+_CONTINUATION_ONLY_RE = re.compile(
+    r"^(?:继续(?:执行|完成|处理|下载|安装|操作|进行|做)?|接着(?:做|执行|处理)?|"
+    r"往下继续|下一步|j继续|continue(?:\s+(?:it|this|working))?|go\s+on|"
+    r"proceed|keep\s+going|resume)[\s。.!！?？]*$",
+    re.IGNORECASE,
+)
+
+
+def _remote_client_tool_task_anchor(
+    messages: list[Mapping[str, Any]], options: Mapping[str, Any]
+) -> dict[str, str] | None:
+    """Keep the active client-tool task when the newest turn only says continue.
+
+    Very large Codex sessions can contain more than a thousand messages. The
+    remote query cap must discard old turns, but a short continuation such as
+    ``继续`` has no task semantics by itself. Preserve the nearest preceding
+    user request as a system constraint so URLs and destination paths survive
+    compaction and the model still emits a caller-owned tool call.
+    """
+    if not _tool_protocol_requested(options, list(messages)):
+        return None
+    user_messages: list[tuple[int, str]] = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, Mapping):
+            continue
+        if str(message.get("role") or "user") != "user":
+            continue
+        text = raw_client._content_to_text(message.get("content")).strip()
+        if text:
+            user_messages.append((index, text))
+    if len(user_messages) < 2:
+        return None
+    latest_index, latest_text = user_messages[-1]
+    if not _CONTINUATION_ONLY_RE.fullmatch(latest_text):
+        return None
+    for index, text in reversed(user_messages[:-1]):
+        if index >= latest_index or _CONTINUATION_ONLY_RE.fullmatch(text):
+            continue
+        max_chars = 16_000
+        if len(text) > max_chars:
+            text = text[:8_000] + "\n...[task middle omitted]...\n" + text[-8_000:]
+        return {
+            "role": "system",
+            "content": (
+                "Active caller task retained during history compaction. The "
+                "latest user message is only a continuation request. Continue "
+                "the task below. For any caller-side download or file change, "
+                "emit the matching client tool call and wait for its result; "
+                "do not claim success from a remote/internal tool.\n\n"
+                + text
+            ),
+        }
+    return None
+
+
+def _requires_remote_model(model: str) -> bool:
+    """Return whether an explicit operator override forces remote routing."""
+
+    configured = _remote_only_models()
+    if not configured:
+        return False
+    if "*" in configured:
+        return True
+    value = str(model or "").strip()
+    if value.lower().startswith("trae/"):
+        value = value[5:]
+    candidates = {value.lower()} if value else set()
+    try:
+        mapped = str(trae_client.convert_model_name(value) or "").strip().lower()
+    except Exception:
+        mapped = ""
+    if mapped:
+        candidates.add(mapped)
+    return bool(candidates & configured)
+
+
+def _chunk_stream_state(chunk: Any) -> str | None:
+    """Return the public stream state proven by one SSE chunk.
+
+    Clients commonly close immediately after the final Chat Completions
+    frame (the one carrying ``finish_reason``), before they consume the
+    protocol ``[DONE]`` sentinel.  Treating that normal close as a cancelled
+    turn makes already-billed streaming requests look unpaid in the console.
+    Parse both OpenAI data frames and Responses event names here so usage
+    tracking has one protocol-aware terminal check.
+    """
+    if isinstance(chunk, (bytes, bytearray)):
+        try:
+            text = bytes(chunk).decode("utf-8", errors="replace")
+        except Exception:
+            text = ""
+    elif isinstance(chunk, str):
+        text = chunk
+    else:
+        text = str(chunk)
+    normalized = text.replace("\r\n", "\n")
+    # Parse one SSE block at a time so a custom ``event: output`` line stays
+    # associated with its data payload. This also handles a proxy coalescing
+    # ``token_usage`` and ``done`` events in one chunk.
+    for block in normalized.split("\n\n"):
+        if not block.strip():
+            continue
+        event_name = ""
+        data_lines: list[str] = []
+        for line in block.split("\n"):
+            stripped = line.strip()
+            if stripped.lower().startswith("event:"):
+                event_name = stripped.split(":", 1)[1].strip().lower()
+            elif stripped.lower().startswith("data:"):
+                data_lines.append(stripped.split(":", 1)[1].lstrip())
+        if event_name in {"response.failed", "error"}:
+            return "error"
+        if event_name in {"response.completed", "response.incomplete"}:
+            return "completed"
+        if not data_lines:
+            if event_name == "done":
+                return "completed"
+            continue
+        payload = "\n".join(data_lines).strip()
+        if payload == "[DONE]":
+            return "completed"
+        try:
+            value = json.loads(payload)
+        except Exception:
+            continue
+        if not isinstance(value, Mapping):
+            if event_name == "done":
+                return "completed"
+            continue
+        value_type = str(value.get("type") or "").strip().lower()
+        if value_type in {"response.failed", "error"}:
+            return "error"
+        if value_type in {"response.completed", "response.incomplete"}:
+            return "completed"
+        if isinstance(value.get("error"), Mapping):
+            return "error"
+        if event_name == "done":
+            status = str(value.get("status") or "").strip().lower()
+            if status in {"error", "failed", "cancelled", "canceled"}:
+                return "error"
+            return "completed"
+        # TraeWork's output event carries the terminal finish reason in its
+        # own payload. A client may close immediately after consuming this
+        # frame, before the adapter's later ``event: done`` sentinel arrives.
+        if event_name == "output" and value.get("finish_reason") not in (None, ""):
+            return "completed"
+        # The public translators put finish_reason inside ``choices`` only on
+        # the final OpenAI frame. Upstream cumulative snapshots are consumed
+        # before translation, so this is safe to use when a client disconnects
+        # just before the following [DONE].
+        choices = value.get("choices")
+        if isinstance(choices, list):
+            for choice in choices:
+                if not isinstance(choice, Mapping):
+                    continue
+                if choice.get("finish_reason") in (None, ""):
+                    continue
+                # A terminal translated frame has an empty delta. Do not
+                # classify a cumulative frame that carries both text/tool data
+                # and a provisional finish_reason as complete.
+                delta = choice.get("delta")
+                if isinstance(delta, Mapping) and not any(
+                    item not in (None, "", [], {}) for item in delta.values()
+                ):
+                    return "completed"
+    return None
+
+
+def _chunk_marks_terminal(chunk: Any) -> bool:
+    """Whether an SSE chunk proves the response reached its end."""
+    return _chunk_stream_state(chunk) is not None
+
+
+async def _tracked_stream(source, tracker: _UsageTracker):
+    context_token = _USAGE_TRACKER.set(tracker)
+    status = "cancelled"
+    saw_terminal = False
+    terminal_status: str | None = None
+    try:
+        await tracker.begin()
+        async for chunk in source:
+            # TraeWork custom streams expose usage as ``event: token_usage``;
+            # feed every frame through the shared parser so streaming and
+            # non-stream requests settle the same usage record.
+            _track_usage_from_chunk(chunk, getattr(tracker, "model", ""))
+            chunk_status = _chunk_stream_state(chunk)
+            if chunk_status is not None:
+                saw_terminal = True
+                # Keep an error terminal state sticky if a cleanup sentinel is
+                # emitted after it.
+                if chunk_status == "error" or terminal_status is None:
+                    terminal_status = chunk_status
+            yield chunk
+        usage_seen = bool(getattr(tracker, "saw_usage", False))
+        status = terminal_status or ("completed" if usage_seen else "cancelled")
+    except asyncio.CancelledError:
+        # A final usage frame is emitted immediately before [DONE] by the
+        # OpenAI translators.  Some clients close after consuming that frame
+        # but before reading [DONE]; preserve the billable turn as completed.
+        usage_seen = bool(getattr(tracker, "saw_usage", False))
+        status = terminal_status or ("completed" if saw_terminal or usage_seen else "cancelled")
+        raise
+    except GeneratorExit:
+        usage_seen = bool(getattr(tracker, "saw_usage", False))
+        status = terminal_status or ("completed" if saw_terminal or usage_seen else "cancelled")
+        raise
+    except Exception:
+        status = "error"
+        raise
+    finally:
+        _USAGE_TRACKER.reset(context_token)
+        await tracker.finish(status)
+
+
+async def _tracked_dispatch(
+    messages: list[dict],
+    model: str,
+    options: dict,
+    tracker: _UsageTracker,
+):
+    context_token = _USAGE_TRACKER.set(tracker)
+    status = "completed"
+    try:
+        await tracker.begin()
+        response = await _dispatch_chat(messages, model, False, options)
+        if getattr(response, "status_code", 200) >= 400:
+            status = "error"
+        return response
+    except Exception:
+        status = "error"
+        raise
+    finally:
+        _USAGE_TRACKER.reset(context_token)
+        await tracker.finish(status)
+
+
+async def run_cli_chat(messages, model, stream: bool, options: Optional[dict] = None):
+    """本地 Trae CLI 子进程上游。"""
+    event_iter = cli_client.stream_cli_chat(messages, model, options=options)
+    translation_options = _tool_translation_options(options, messages)
+    if not stream:
+        result = await collect_nonstream_cli(event_iter, model, **translation_options)
+        _track_usage_from_result(result, model)
+        return JSONResponse(content=result)
+
+    first, rest = await _peek_async(event_iter)
+    if first is None:
+        async def empty_gen():
+            async for chunk in translate_cli_stream(
+                _empty_cli_events(), model, FORWARD_USAGE, **translation_options
+            ):
+                yield chunk
+        return StreamingResponse(empty_gen(), media_type="text/event-stream", headers=_sse_headers())
+    if first.type == "error":
+        raise RuntimeError(first.error or "Trae CLI failed before output")
+
+    async def gen():
+        async def chain():
+            yield first
+            async for item in rest:
+                yield item
+        async for chunk in translate_cli_stream(
+            chain(), model, FORWARD_USAGE, **translation_options
+        ):
+            _track_usage_from_chunk(chunk, model)
+            yield chunk
+
+    return StreamingResponse(gen(), media_type="text/event-stream", headers=_sse_headers())
+
+
+async def _await_session_cleanup(task: asyncio.Task) -> None:
+    """Finish owned cleanup before propagating repeated client cancellation."""
+    pending_exception = sys.exception()
+    cancellation = (
+        pending_exception if isinstance(pending_exception, asyncio.CancelledError) else None
+    )
+    with anyio.CancelScope(shield=True):
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as exc:
+                if task.cancelled():
+                    raise
+                cancellation = cancellation or exc
+            except Exception:
+                break
+        try:
+            task.result()
+        except BaseException:
+            if cancellation is None:
+                raise
+            logger.warning("session cleanup failed while client cancelled", exc_info=True)
+    if cancellation is not None:
+        raise cancellation
+
+
+class _SessionStreamIterator:
+    """Keep cleanup ownership even when a response is closed before iteration."""
+
+    def __init__(self, source, close):
+        self._source = source
+        self._close = close
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        return await anext(self._source)
+
+    async def aclose(self):
+        try:
+            await self._source.aclose()
+        finally:
+            await self._close()
+
+
+def _chat_response_closer(response, upstream_metadata: dict[str, Any]):
+    cleanup_task = None
+
+    async def cleanup() -> None:
+        try:
+            _bind_usage_turn_from_metadata(upstream_metadata)
+        finally:
+            response.close()
+
+    async def close() -> None:
+        nonlocal cleanup_task
+        if cleanup_task is None:
+            cleanup_task = asyncio.create_task(cleanup())
+        await _await_session_cleanup(cleanup_task)
+
+    return close
+
+
+async def run_web_session(messages, model, stream: bool, options: Optional[dict] = None):
+    """OmniRoute 风格网页版 remote 会话，带账号并发槽和空闲回收。"""
+    options = dict(options or {})
+    token = str(options.get("_auth_token") or "").strip()
+    account_id = str(options.get("_account_id") or "").strip()
+    record = auth.get_account_record(account_id) if account_id else {}
+    if not account_id and not token:
+        account_id, record = auth.get_model_account_snapshot()
+    if not token and account_id:
+        token = str((record or {}).get("token") or "").strip()
+    if not token and not account_id:
+        if auth.get_accounts_raw():
+            raise _ModelAccountUnavailable(
+                "No enabled model account available; enable an account in 账号与签到"
+            )
+        token = str(auth.get_token() or "").strip()
+    _ensure_model_account_enabled(account_id, token)
+    token_identity = _account_id_from_token(token)
+    if token_identity:
+        account_id = token_identity
+    if not account_id:
+        account_id = str(
+            auth.get_active_account_id() or auth.get_user_id() or token[:16] or "default"
+        )
+    if not token:
+        token = str((auth.get_account_record(account_id) or {}).get("token") or "").strip()
+    if not token:
+        raise RuntimeError("No Cloud-IDE-JWT token available")
+    translation_options = _tool_translation_options(options, messages)
+    bound_options = {**options, "_auth_token": token, "_account_id": account_id}
+    provider_specific = bound_options.get("provider_specific")
+    if provider_specific is None and "providerSpecificData" in bound_options:
+        provider_specific = bound_options.get("providerSpecificData")
+    if not isinstance(provider_specific, Mapping):
+        provider_specific = (record or {}).get("provider_specific") or (
+            record or {}
+        ).get("providerSpecificData")
+    bound_options["provider_specific"] = (
+        dict(provider_specific) if isinstance(provider_specific, Mapping) else {}
+    )
+    await trae_client.acquire_web_slot(
+        account_id, timeout=float(os.environ.get("TRAE_WEB_SLOT_TIMEOUT", "60"))
+    )
+    client = None
+    session_id = ""
+    message_id = ""
+    lease_registered = False
+    cleanup_task = None
+
+    async def cleanup_web_session() -> None:
+        # Claim the registered lease before any await so the idle reaper and
+        # response teardown cannot both close and release the same resources.
+        if lease_registered and not trae_client.unregister_web_lease(session_id):
+            return
+        try:
+            if session_id and client is not None:
+                await trae_client.stop_web_session(
+                    client, session_id, message_id, options=bound_options
+                )
+        finally:
+            try:
+                if client is not None:
+                    await client.aclose()
+            finally:
+                trae_client.release_web_slot(account_id)
+
+    async def close_web_session() -> None:
+        nonlocal cleanup_task
+        if cleanup_task is None:
+            cleanup_task = asyncio.create_task(cleanup_web_session())
+        await _await_session_cleanup(cleanup_task)
+
+    try:
+        client = httpx.AsyncClient(timeout=60)
+        session_id, message_id = await trae_client.create_web_session(
+            client,
+            model,
+            messages,
+            options=bound_options,
+        )
+        _bind_usage_turn(message_id)
+        trae_client.register_web_lease(
+            account_id,
+            session_id,
+            message_id,
+            client,
+            token=token,
+            provider_specific=bound_options.get("provider_specific"),
+        )
+        lease_registered = True
+        event_iter = trae_client.stream_web_events(
+            client, session_id, message_id, options=bound_options
+        )
+        if stream:
+            async def gen():
+                try:
+                    async for chunk in translate_web_events(
+                        event_iter, model, FORWARD_USAGE, **translation_options
+                    ):
+                        _track_usage_from_chunk(chunk, model)
+                        yield chunk
+                finally:
+                    await close_web_session()
+            return StreamingResponse(
+                _SessionStreamIterator(gen(), close_web_session),
+                media_type="text/event-stream",
+                headers=_sse_headers(),
+            )
+        try:
+            result = await collect_nonstream_web(
+                event_iter, model, **translation_options
+            )
+            _track_usage_from_result(result, model)
+            return JSONResponse(content=result)
+        finally:
+            await close_web_session()
+    except BaseException:
+        await close_web_session()
+        raise
+
+
+async def run_remote_session(messages, model, stream: bool, options: Optional[dict] = None):
+    """9router-style Trae remote session using the current account snapshot.
+
+    Unlike the legacy web helper, this path never reads a mutable global token
+    after dispatch.  The account-bound token and provider metadata captured by
+    ``_bind_chat_session`` are used for both create and events requests.
+    """
+    options = dict(options or {})
+    account_id = str(options.get("_account_id") or "").strip()
+    token = str(options.get("_auth_token") or "").strip()
+    model_record: dict = {}
+    if not account_id and not token:
+        account_id, model_record = auth.get_model_account_snapshot()
+    if not token and account_id:
+        # A bound account owns its credential.  Do not fall back to the
+        # mutable global token, which may belong to a concurrently selected
+        # account.
+        token = str((auth.get_account_record(account_id) or {}).get("token") or "").strip()
+    if not token and not account_id:
+        if auth.get_accounts_raw():
+            raise _ModelAccountUnavailable(
+                "No enabled model account available; enable an account in 账号与签到"
+            )
+        token = str(auth.get_token() or "").strip()
+    _ensure_model_account_enabled(account_id, token)
+    token_identity = _account_id_from_token(token)
+    if token_identity:
+        # The JWT is the identity Trae bills.  It is authoritative if an old
+        # account-store key or UI selection is stale.
+        account_id = token_identity
+    if not account_id:
+        account_id = str(auth.get_active_account_id() or "default")
+    record = auth.get_account_record(account_id) if account_id else model_record
+    if not token:
+        token = str(record.get("token") or "").strip()
+    if not token:
+        raise RuntimeError("No Cloud-IDE-JWT token available")
+    remote_options = dict(options)
+    # Caller-owned tools must run in the API client's workspace.  Agent owns a
+    # separate remote workspace and can consume file/shell work internally,
+    # then return only a success sentence; Work keeps the advertised tools as
+    # calls for Codex/the API client to execute.  Plain text requests remain
+    # Agent-first (including the 1M/max profile), and operators can explicitly
+    # opt tool requests back into Agent with ``...USE_WORK=0`` for diagnostics.
+    caller_tools_use_work = (
+        os.environ.get("TRAE_REMOTE_CALLER_TOOLS_USE_WORK", "1").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+    if (
+        caller_tools_use_work
+        and _tool_protocol_requested(options, messages)
+        and not remote_options.get("_remote_agent_type")
+        and not remote_options.get("remote_agent_type")
+    ):
+        # Agent sessions own a remote workspace and may consume their internal
+        # shell/file tools, then report success without emitting a caller tool
+        # call. Work mode has no such ownership ambiguity: caller-advertised
+        # tools remain executable only by Codex/the API client.
+        remote_options["_remote_agent_type"] = "solo_work_remote"
+        remote_options["_session_variant"] = "caller-tools-work"
+    # A session lease may carry provider metadata captured from the account
+    # store before the JWT identity is normalized. Prefer that bound snapshot;
+    # only consult the mutable account lookup as a fallback.
+    provider_specific = remote_options.get("provider_specific") or remote_options.get(
+        "providerSpecificData"
+    )
+    if not isinstance(provider_specific, Mapping):
+        provider_specific = record.get("provider_specific") or record.get(
+            "providerSpecificData"
+        )
+    remote_options["provider_specific"] = (
+        dict(provider_specific) if isinstance(provider_specific, Mapping) else {}
+    )
+    slot_released = False
+    cleanup_task = None
+
+    def release_slot_once() -> None:
+        """Release the account slot exactly once across all exit paths."""
+
+        nonlocal slot_released
+        if slot_released:
+            return
+        slot_released = True
+        trae_client.release_web_slot(account_id)
+
+    client = None
+    session_id = ""
+    message_id = ""
+
+    async def cleanup_remote_session() -> None:
+        """Stop and close one remote attempt without leaking its account slot."""
+        try:
+            if session_id and client is not None:
+                await trae_remote_client.stop_session(
+                    client,
+                    token,
+                    session_id,
+                    message_id,
+                    options=remote_options,
+                )
+        finally:
+            try:
+                if client is not None:
+                    await client.aclose()
+            finally:
+                release_slot_once()
+
+    async def close_remote_session() -> None:
+        nonlocal cleanup_task
+        if cleanup_task is None:
+            cleanup_task = asyncio.create_task(cleanup_remote_session())
+        await _await_session_cleanup(cleanup_task)
+
+    translation_options = _tool_translation_options(options, messages)
+    explicit_remote_type = str(
+        remote_options.get("_remote_agent_type")
+        or remote_options.get("remote_agent_type")
+        or ""
+    ).strip().lower()
+    explicit_work = explicit_remote_type in {
+        "solo_work_remote",
+        "solo_work_lite",
+        "work",
+    } or str(model or "").strip().lower() in {"work", "auto-work", "solo-work"}
+    work_fallback_enabled = (
+        os.environ.get("TRAE_REMOTE_WORK_FALLBACK", "1").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+    can_work_fallback = work_fallback_enabled and not explicit_work
+    can_work_fallback = can_work_fallback and (
+        trae_remote_client.remote_agent_type(model, remote_options)
+        == "solo_agent_remote"
+    )
+    work_fallback_used = False
+
+    def work_fallback_options(base: Mapping[str, Any]) -> dict[str, Any]:
+        fallback = dict(base)
+        fallback["_remote_agent_type"] = "solo_work_remote"
+        fallback["_session_variant"] = "work-fallback"
+        return fallback
+
+    # Inject caller-owned tool definitions as a system prompt so the
+    # remote upstream sees the available tools even though its transport
+    # only accepts text messages.
+    prepared_messages = trae_client._messages_with_client_runtime(messages, options)
+    task_anchor = _remote_client_tool_task_anchor(messages, options)
+    if task_anchor is not None:
+        prepared_messages = [prepared_messages[0], task_anchor, *prepared_messages[1:]]
+        logger.info(
+            "remote retained active client-tool task id=%s anchor_chars=%d",
+            str(options.get("_relay_request_id") or ""),
+            len(task_anchor["content"]),
+        )
+    compact_options = dict(options)
+    # The agent-remote session advertises a 1M-token window, but the upstream
+    # silently drops sessions whose flattened query exceeds ~500k chars.
+    # Bound history by message count and content size first, then trim the
+    # flattened query to the hard cap so large tool sessions still respond.
+    compact_options.setdefault(
+        "trae_raw_max_messages",
+        os.environ.get("TRAE_REMOTE_MAX_MESSAGES", "500"),
+    )
+    compact_options.setdefault(
+        "trae_raw_max_history_chars",
+        os.environ.get("TRAE_REMOTE_MAX_HISTORY_CHARS", "480000"),
+    )
+    compact_options.setdefault(
+        "trae_remote_query_max_chars",
+        os.environ.get("TRAE_REMOTE_QUERY_MAX_CHARS", "480000"),
+    )
+    original_message_count = len(prepared_messages)
+    prepared_messages, omitted_history = raw_client._compact_raw_history(
+        prepared_messages, compact_options
+    )
+    prepared_messages, query_trimmed = _bounded_remote_query(
+        prepared_messages, compact_options
+    )
+    if omitted_history:
+        logger.info(
+            "remote history compacted input_messages=%d output_messages=%d omitted=%d",
+            original_message_count,
+            len(prepared_messages),
+            omitted_history,
+        )
+    if query_trimmed:
+        logger.warning(
+            "remote query trimmed for upstream size input_messages=%d output_messages=%d dropped=%d query_chars=%d",
+            original_message_count,
+            len(prepared_messages),
+            query_trimmed,
+            len(trae_client.flatten_query(prepared_messages)),
+        )
+    await trae_client.acquire_web_slot(
+        account_id,
+        timeout=float(os.environ.get("TRAE_WEB_SLOT_TIMEOUT", "60")),
+    )
+    try:
+        client = httpx.AsyncClient(timeout=None)
+        logger.info(
+            "remote create start id=%s account=%s model=%s messages=%d last_chars=%d",
+            str(options.get("_relay_request_id") or ""),
+            account_id,
+            model,
+            len(messages),
+            len(str(messages[-1].get("content") or "")) if messages else 0,
+        )
+        try:
+            session_id, message_id = await trae_remote_client.create_session(
+                client,
+                token,
+                model,
+                prepared_messages,
+                options=remote_options,
+            )
+        except Exception as create_exc:
+            if not can_work_fallback:
+                raise
+            logger.warning(
+                "remote Agent create failed; falling back to Work id=%s model=%s error=%s",
+                str(options.get("_relay_request_id") or ""),
+                model,
+                create_exc,
+            )
+            # No session id was returned, so the failed create cannot be
+            # stopped. Reuse the acquired account slot with a fresh client.
+            failed_client = client
+            client = None
+            await _await_session_cleanup(asyncio.create_task(failed_client.aclose()))
+            client = httpx.AsyncClient(timeout=None)
+            remote_options = work_fallback_options(remote_options)
+            work_fallback_used = True
+            session_id, message_id = await trae_remote_client.create_session(
+                client,
+                token,
+                model,
+                prepared_messages,
+                options=remote_options,
+            )
+        _bind_usage_turn(message_id)
+        logger.info(
+            "remote create ok id=%s chat_session=%s message=%s",
+            str(options.get("_relay_request_id") or ""),
+            session_id,
+            message_id,
+        )
+        event_iter = trae_remote_client.stream_events(
+            client,
+            token,
+            session_id,
+            message_id,
+            options=remote_options,
+        )
+        if stream:
+            async def gen():
+                nonlocal work_fallback_used
+                request_id = str(options.get("_relay_request_id") or "")
+                started_at = time.monotonic()
+                chunk_count = 0
+                tool_chunk_count = 0
+                saw_done = False
+                stream_status = "running"
+                try:
+                    try:
+                        async for chunk in translate_web_events(
+                            event_iter,
+                            model,
+                            FORWARD_USAGE,
+                            fail_on_empty=True,
+                            **translation_options,
+                        ):
+                            _track_usage_from_chunk(chunk, model)
+                            chunk_count += 1
+                            if '"tool_calls"' in chunk:
+                                tool_chunk_count += 1
+                            if "data: [DONE]" in chunk:
+                                saw_done = True
+                                stream_status = "completed"
+                            yield chunk
+                        stream_status = "completed"
+                    except (
+                        EmptyUpstreamResponse,
+                        trae_remote_client.RemoteFirstEventTimeout,
+                    ) as exc:
+                        exc_usage = getattr(exc, "usage", None)
+                        exc_retryable = bool(getattr(exc, "retryable", True))
+                        exc_observed_model_event = bool(
+                            getattr(exc, "observed_model_event", False)
+                        )
+                        quota_exhausted = bool(
+                            getattr(exc, "account_quota_exhausted", False)
+                        )
+                        if exc_usage is not None:
+                            _track_usage_from_exception(exc, model)
+                        polling_retry_enabled = bool(
+                            auth.get_polling_status().get("enabled")
+                        )
+                        if (
+                            not exc_retryable
+                            or work_fallback_used
+                            or not (can_work_fallback or polling_retry_enabled)
+                            or (quota_exhausted and not polling_retry_enabled)
+                        ):
+                            logger.warning(
+                                "remote empty response is not safe to retry "
+                                "id=%s model=%s observed_model_event=%s "
+                                "fallback_used=%s quota_exhausted=%s",
+                                request_id,
+                                model,
+                                exc_observed_model_event,
+                                work_fallback_used,
+                                quota_exhausted,
+                            )
+                            raise
+                        logger.warning(
+                            "remote upstream ended before any model event; "
+                            "%s once id=%s model=%s",
+                            (
+                                "rotating account after quota exhaustion"
+                                if quota_exhausted
+                                else (
+                                    "falling back to Work"
+                                    if can_work_fallback and not work_fallback_used
+                                    else "retrying"
+                                )
+                            ),
+                            request_id,
+                            model,
+                        )
+                        await close_remote_session()
+                        slot_reacquired = False
+                        retry_client = None
+                        retry_session_id = ""
+                        retry_message_id = ""
+                        retry_account_id = account_id
+
+                        async def cleanup_retry_session() -> None:
+                            try:
+                                if retry_session_id and retry_client is not None:
+                                    try:
+                                        await trae_remote_client.stop_session(
+                                            retry_client,
+                                            retry_token,
+                                            retry_session_id,
+                                            retry_message_id,
+                                            options=retry_options,
+                                        )
+                                    except Exception:
+                                        pass
+                            finally:
+                                try:
+                                    if retry_client is not None:
+                                        await retry_client.aclose()
+                                finally:
+                                    if slot_reacquired:
+                                        trae_client.release_web_slot(retry_account_id)
+
+                        try:
+                            retry_options = dict(remote_options)
+                            retry_model = model
+                            if (
+                                can_work_fallback
+                                and not work_fallback_used
+                                and not quota_exhausted
+                            ):
+                                retry_options = work_fallback_options(retry_options)
+                                work_fallback_used = True
+                            retry_token = token
+                            # A 4008 is account-scoped. Never retry it through
+                            # the same account's Work executor; rotate to a
+                            # different enabled credential instead. Ordinary
+                            # empty Agent responses retain the historical
+                            # same-account Work fallback before rotation.
+                            if polling_retry_enabled and (
+                                quota_exhausted
+                                or not (can_work_fallback and work_fallback_used)
+                            ):
+                                next_snapshot = _next_retry_account_snapshot(
+                                    {_retry_account_key(options, 0)}, 1
+                                )
+                                if next_snapshot is not None:
+                                    next_account_id, record = next_snapshot
+                                    retry_account_id = next_account_id
+                                    retry_token = (
+                                        str(record.get("token") or "") or retry_token
+                                    )
+                                    retry_billing_id = (
+                                        _account_id_from_token(retry_token)
+                                        or next_account_id
+                                    )
+                                    retry_options = dict(retry_options)
+                                    retry_options["_account_id"] = next_account_id
+                                    retry_options["_billing_id"] = retry_billing_id
+                                    retry_options["_auth_token"] = retry_token
+                                    retry_options["_auth_user_id"] = retry_billing_id
+                                    retry_provider = (
+                                        record.get("provider_specific")
+                                        or record.get("providerSpecificData")
+                                        or {}
+                                    )
+                                    if isinstance(retry_provider, Mapping):
+                                        retry_options["provider_specific"] = dict(
+                                            retry_provider
+                                        )
+                                    retry_tracker = _USAGE_TRACKER.get()
+                                    if retry_tracker is not None:
+                                        await retry_tracker.rebind(retry_options)
+                                    _rebind_chat_session_account(
+                                        str(
+                                            retry_options.get("session_id")
+                                            or retry_options.get("sessionId")
+                                            or ""
+                                        ),
+                                        next_account_id,
+                                        retry_billing_id,
+                                        retry_token,
+                                        retry_provider,
+                                    )
+                                elif quota_exhausted:
+                                    # Do not reacquire the exhausted account
+                                    # and replay the turn. The caller receives
+                                    # the original quota error instead.
+                                    raise
+                            await trae_client.acquire_web_slot(
+                                retry_account_id,
+                                timeout=float(
+                                    os.environ.get("TRAE_WEB_SLOT_TIMEOUT", "60")
+                                ),
+                            )
+                            slot_reacquired = True
+                            retry_client = httpx.AsyncClient(timeout=None)
+                            logger.info(
+                                "remote empty retry start id=%s model=%s account=%s",
+                                request_id,
+                                model,
+                                str(retry_options.get("_account_id") or ""),
+                            )
+                            retry_session_id, retry_message_id = (
+                                await trae_remote_client.create_session(
+                                    retry_client,
+                                    retry_token,
+                                    retry_model,
+                                    prepared_messages,
+                                    options=retry_options,
+                                )
+                            )
+                            # The first Agent attempt ended before any model
+                            # event. Credit enrichment must follow the Work (or
+                            # rotated-account) attempt that actually completed.
+                            _bind_usage_turn(retry_message_id, replace=True)
+                            retry_event_iter = trae_remote_client.stream_events(
+                                retry_client,
+                                retry_token,
+                                retry_session_id,
+                                retry_message_id,
+                                options=retry_options,
+                            )
+                            async for chunk in translate_web_events(
+                                retry_event_iter,
+                                model,
+                                FORWARD_USAGE,
+                                fail_on_empty=True,
+                                **translation_options,
+                            ):
+                                _track_usage_from_chunk(chunk, model)
+                                chunk_count += 1
+                                if '"tool_calls"' in chunk:
+                                    tool_chunk_count += 1
+                                if "data: [DONE]" in chunk:
+                                    saw_done = True
+                                    stream_status = "completed"
+                                yield chunk
+                            stream_status = "completed"
+                        finally:
+                            await _await_session_cleanup(
+                                asyncio.create_task(cleanup_retry_session())
+                            )
+                except asyncio.CancelledError:
+                    stream_status = "client_cancelled"
+                    raise
+                except GeneratorExit:
+                    stream_status = "client_closed" if not saw_done else "completed"
+                    raise
+                except Exception:
+                    stream_status = "error"
+                    raise
+                finally:
+                    logger.info(
+                        "public stream closed id=%s status=%s chunks=%d "
+                        "tool_chunks=%d done=%s elapsed_ms=%d",
+                        request_id,
+                        stream_status,
+                        chunk_count,
+                        tool_chunk_count,
+                        saw_done,
+                        int((time.monotonic() - started_at) * 1000),
+                    )
+                    await close_remote_session()
+
+            return StreamingResponse(
+                _SessionStreamIterator(gen(), close_remote_session),
+                media_type="text/event-stream",
+                headers=_sse_headers(),
+            )
+        try:
+            result = await collect_nonstream_web(
+                event_iter,
+                model,
+                fail_on_empty=True,
+                **translation_options,
+            )
+            _track_usage_from_result(result, model)
+            return JSONResponse(content=result)
+        except EmptyUpstreamResponse as exc:
+            _track_usage_from_exception(exc, model)
+            if not (can_work_fallback and not work_fallback_used and exc.retryable):
+                raise
+            logger.warning(
+                "remote upstream ended before any model event; falling back to Work "
+                "id=%s model=%s",
+                str(options.get("_relay_request_id") or ""),
+                model,
+            )
+            work_fallback_used = True
+            stopped_session_id = session_id
+            stopped_message_id = message_id
+            session_id = ""
+            message_id = ""
+            try:
+                if stopped_session_id:
+                    await _await_session_cleanup(
+                        asyncio.create_task(
+                            trae_remote_client.stop_session(
+                                client,
+                                token,
+                                stopped_session_id,
+                                stopped_message_id,
+                                options=remote_options,
+                            )
+                        )
+                    )
+            except Exception:
+                pass
+            remote_options = work_fallback_options(remote_options)
+            session_id, message_id = await trae_remote_client.create_session(
+                client,
+                token,
+                model,
+                prepared_messages,
+                options=remote_options,
+            )
+            # Replace the empty Agent attempt's message id with the Work turn
+            # that produced the response and incurred the final charge.
+            _bind_usage_turn(message_id, replace=True)
+            fallback_events = trae_remote_client.stream_events(
+                client,
+                token,
+                session_id,
+                message_id,
+                options=remote_options,
+            )
+            result = await collect_nonstream_web(
+                fallback_events,
+                model,
+                fail_on_empty=True,
+                **translation_options,
+            )
+            _track_usage_from_result(result, model)
+            return JSONResponse(content=result)
+        finally:
+            await close_remote_session()
+    except BaseException:
+        await close_remote_session()
+        raise
+
+
+def _effort_note(effort: str, trace: Mapping[str, Any]) -> Optional[str]:
+    """Explain why a requested thinking strength was not applied."""
+
+    if not effort or trace.get("reasoning_effort_applied"):
+        return None
+    mode = str(trace.get("actual_mode") or trace.get("actual_endpoint") or "")
+    if mode in {"ide", "solo"}:
+        # llm_utils_chat is the IDE/Solo utility route (titles/prompt tools); the
+        # real IDE sends strength only via the ai-agent task, so the field is
+        # ignored here.
+        return "llm_utils_chat 端点不接受强度字段"
+    if mode == "raw":
+        return "raw 端点需要企业 PAT"
+    return "该模型未声明 reasoning_effort_config"
+
+
+async def run_ide_chat(messages, model, stream: bool, options: Optional[dict] = None):
+    """trae2api 风格 IDE chat，流式响应消费完成后关闭 response 和 client。"""
+    translation_options = _tool_translation_options(options, messages)
+    upstream_metadata: dict[str, Any] = {}
+    ide_resp = await trae_client.send_chat_request(messages, model, stream, options=options)
+    response = ide_resp.response
+    close_response = _chat_response_closer(ide_resp, upstream_metadata)
+    if stream:
+        async def gen():
+            try:
+                async for chunk in translate_ide_stream(
+                    response,
+                    model,
+                    FORWARD_USAGE,
+                    fail_on_empty=True,
+                    upstream_metadata=upstream_metadata,
+                    **translation_options,
+                ):
+                    _bind_usage_turn_from_metadata(upstream_metadata)
+                    _track_usage_from_chunk(chunk, model)
+                    yield chunk
+            finally:
+                await close_response()
+        try:
+            return StreamingResponse(
+                _SessionStreamIterator(gen(), close_response),
+                media_type="text/event-stream",
+                headers=_sse_headers(),
+            )
+        except BaseException:
+            await close_response()
+            raise
+    try:
+        result = await collect_nonstream_ide(
+            response,
+            model,
+            fail_on_empty=True,
+            upstream_metadata=upstream_metadata,
+            **translation_options,
+        )
+        _bind_usage_turn_from_metadata(upstream_metadata)
+        _track_usage_from_result(result, model)
+        return JSONResponse(content=result)
+    finally:
+        await close_response()
+
+
+async def run_traework_native_chat(
+    messages, model, stream: bool, options: Optional[dict] = None
+):
+    """TraeWork native AHA bridge backed by an external Windows helper.
+
+    The helper owns ai_agent.dll and sscronet.dll and returns the native SSE
+    event stream. Linux deployments receive a clear 502 instead of attempting
+    to load a Windows PE DLL.
+    """
+
+    translation_options = _tool_translation_options(options, messages)
+    upstream_metadata: dict[str, Any] = {}
+    native_resp = await traework_native_bridge.send_native_chat_request(
+        messages,
+        model,
+        stream=stream,
+        options=options,
+    )
+    close_response = _chat_response_closer(native_resp, upstream_metadata)
+    if stream:
+        async def gen():
+            try:
+                async for chunk in translate_ide_stream(
+                    native_resp.response,
+                    model,
+                    FORWARD_USAGE,
+                    fail_on_empty=True,
+                    upstream_metadata=upstream_metadata,
+                    **translation_options,
+                ):
+                    _bind_usage_turn_from_metadata(upstream_metadata)
+                    _track_usage_from_chunk(chunk, model)
+                    yield chunk
+            finally:
+                await close_response()
+
+        try:
+            return StreamingResponse(
+                _SessionStreamIterator(gen(), close_response),
+                media_type="text/event-stream",
+                headers=_sse_headers(),
+            )
+        except BaseException:
+            await close_response()
+            raise
+    try:
+        result = await collect_nonstream_ide(
+            native_resp.response,
+            model,
+            fail_on_empty=True,
+            upstream_metadata=upstream_metadata,
+            **translation_options,
+        )
+        _bind_usage_turn_from_metadata(upstream_metadata)
+        _track_usage_from_result(result, model)
+        return JSONResponse(content=result)
+    finally:
+        await close_response()
+
+
+async def run_raw_chat(messages, model, stream: bool, options: Optional[dict] = None):
+    """直连 Trae 原生 chat 协议，响应暂复用 IDE SSE 翻译器。"""
+    translation_options = _tool_translation_options(options, messages)
+    upstream_metadata: dict[str, Any] = {}
+    logger.info(
+        "raw send start id=%s model=%s messages=%d last_chars=%d",
+        str((options or {}).get("_relay_request_id") or ""),
+        model,
+        len(messages),
+        len(str(messages[-1].get("content") or "")) if messages else 0,
+    )
+    raw_resp = await raw_client.send_raw_chat_request(messages, model, options)
+    current = raw_resp
+    close_current = _chat_response_closer(current, upstream_metadata)
+
+    async def close_response() -> None:
+        await close_current()
+
+    try:
+        logger.info(
+            "raw send ok id=%s status=%s",
+            str((options or {}).get("_relay_request_id") or ""),
+            getattr(raw_resp.response, "status_code", 0),
+        )
+        _capture_chat_session_auth(
+            str((options or {}).get("session_id") or ""),
+            str(getattr(raw_resp, "auth_token", "") or ""),
+        )
+    except BaseException:
+        await close_response()
+        raise
+    if stream:
+        async def gen():
+            nonlocal current, close_current
+            request_id = str((options or {}).get("_relay_request_id") or "")
+            started_at = time.monotonic()
+            chunk_count = 0
+            tool_chunk_count = 0
+            saw_done = False
+            stream_status = "running"
+            try:
+                retry_options = dict(options or {})
+                for attempt in range(2):
+                    try:
+                        async for chunk in translate_ide_stream(
+                            current.response,
+                            model,
+                            FORWARD_USAGE,
+                            fail_on_empty=True,
+                            require_terminal=False,
+                            upstream_metadata=upstream_metadata,
+                            **translation_options,
+                        ):
+                            _bind_usage_turn_from_metadata(upstream_metadata)
+                            chunk_count += 1
+                            if '"tool_calls"' in chunk:
+                                tool_chunk_count += 1
+                            if "data: [DONE]" in chunk:
+                                saw_done = True
+                                stream_status = "completed"
+                            _track_usage_from_chunk(chunk, model)
+                            yield chunk
+                        stream_status = "completed"
+                        return
+                    except RepeatedCompletedToolResponse as exc:
+                        _track_usage_from_exception(exc, model)
+                        logger.warning(
+                            "raw upstream repeated an already completed tool call; "
+                            "automatic replay is disabled to avoid a second billed turn"
+                        )
+                        raise
+                    except EmptyUpstreamResponse as exc:
+                        _bind_usage_turn_from_metadata(upstream_metadata)
+                        _track_usage_from_exception(exc, model)
+                        if attempt or not exc.retryable:
+                            logger.warning(
+                                "raw upstream response is not safe to retry "
+                                "attempt=%d observed_model_event=%s",
+                                attempt + 1,
+                                exc.observed_model_event,
+                            )
+                            raise
+                        logger.warning(
+                            "raw upstream ended before any model event; retrying once"
+                        )
+                        retry_options = dict(options or {})
+                    finally:
+                        await close_response()
+
+                    try:
+                        current = await raw_client.send_raw_chat_request(
+                            messages, model, retry_options
+                        )
+                        close_current = _chat_response_closer(current, upstream_metadata)
+                        _capture_chat_session_auth(
+                            str((options or {}).get("session_id") or ""),
+                            str(getattr(current, "auth_token", "") or ""),
+                        )
+                    except Exception as exc:
+                        logger.warning("raw empty-response retry failed: %s", exc)
+                        stream_status = "empty_retry_failed"
+                        raise
+            except asyncio.CancelledError:
+                stream_status = "client_cancelled"
+                raise
+            except GeneratorExit:
+                stream_status = "client_closed" if not saw_done else "completed"
+                raise
+            except Exception:
+                stream_status = "error"
+                raise
+            finally:
+                await close_response()
+                logger.info(
+                    "raw stream closed id=%s status=%s chunks=%d tool_chunks=%d done=%s elapsed_ms=%d",
+                    request_id,
+                    stream_status,
+                    chunk_count,
+                    tool_chunk_count,
+                    saw_done,
+                    int((time.monotonic() - started_at) * 1000),
+                )
+        try:
+            return StreamingResponse(
+                _SessionStreamIterator(gen(), close_response),
+                media_type="text/event-stream",
+                headers=_sse_headers(),
+            )
+        except BaseException:
+            await close_response()
+            raise
+
+    retry_options = dict(options or {})
+    for attempt in range(2):
+        try:
+            result = await collect_nonstream_ide(
+                current.response,
+                model,
+                fail_on_empty=True,
+                require_terminal=False,
+                upstream_metadata=upstream_metadata,
+                **translation_options,
+            )
+            _bind_usage_turn_from_metadata(upstream_metadata)
+            _track_usage_from_result(result, model)
+            return JSONResponse(content=result)
+        except RepeatedCompletedToolResponse as exc:
+            _bind_usage_turn_from_metadata(upstream_metadata)
+            _track_usage_from_exception(exc, model)
+            logger.warning(
+                "raw upstream repeated an already completed tool call; "
+                "automatic replay is disabled to avoid a second billed turn"
+            )
+            raise
+        except EmptyUpstreamResponse as exc:
+            _bind_usage_turn_from_metadata(upstream_metadata)
+            _track_usage_from_exception(exc, model)
+            if attempt or not exc.retryable:
+                logger.warning(
+                    "raw upstream response is not safe to retry "
+                    "attempt=%d observed_model_event=%s",
+                    attempt + 1,
+                    exc.observed_model_event,
+                )
+                raise
+            logger.warning(
+                "raw upstream ended before any model event; retrying once"
+            )
+            retry_options = dict(options or {})
+        finally:
+            await close_response()
+        try:
+            current = await raw_client.send_raw_chat_request(
+                messages, model, retry_options
+            )
+            close_current = _chat_response_closer(current, upstream_metadata)
+            _capture_chat_session_auth(
+                str((options or {}).get("session_id") or ""),
+                str(getattr(current, "auth_token", "") or ""),
+            )
+        except BaseException as exc:
+            await close_response()
+            logger.warning("raw empty-response retry failed: %s", exc)
+            raise
+
+    raise RuntimeError("raw empty-response retry ended unexpectedly")
+
+
+def _openai_error(status: int, message: str, error_type: str, param: Optional[str] = None) -> JSONResponse:
+    body = {"error": {"message": message, "type": error_type}}
+    if param:
+        body["error"]["param"] = param
+    return JSONResponse(body, status_code=status)
+
+
+def _retry_account_key(options: Optional[Mapping[str, Any]], fallback_index: int) -> str:
+    options = options or {}
+    token = str(options.get("_auth_token") or "")
+    token_identity = _account_id_from_token(token)
+    if token_identity:
+        # The JWT owner is the account Trae actually bills. Two stale account
+        # rows that reference the same JWT must not receive this request twice.
+        return token_identity
+    if token:
+        return "token:" + hashlib.sha256(token.encode("utf-8")).hexdigest()
+    account_id = str(
+        options.get("_account_id")
+        or options.get("_billing_id")
+        or auth.get_active_account_id()
+        or ""
+    )
+    if account_id:
+        return account_id
+    return f"attempt-{fallback_index}"
+
+
+def _polling_retry_limit(options: Optional[Mapping[str, Any]]) -> int:
+    """Count usable polling accounts without granting an extra retry."""
+
+    account_ids: set[str] = set()
+    anonymous_accounts = 0
+    for account in auth.list_accounts():
+        if isinstance(account, Mapping):
+            if (
+                account.get("is_valid") is False
+                or account.get("model_enabled") is False
+                or account.get("model_eligible") is False
+            ):
+                continue
+            account_id = str(account.get("id") or "")
+            if account_id:
+                account_ids.add(account_id)
+            else:
+                anonymous_accounts += 1
+        else:
+            anonymous_accounts += 1
+    bound_account = str((options or {}).get("_account_id") or "")
+    if bound_account and auth._record_model_enabled(auth.get_account_record(bound_account)):
+        account_ids.add(bound_account)
+    return max(1, len(account_ids) + anonymous_accounts)
+
+
+def _next_retry_account_snapshot(
+    attempted_accounts: set[str], max_rotations: int
+) -> tuple[str, dict] | None:
+    """Rotate to an account that has not already received this request."""
+
+    for rotation_index in range(max(1, max_rotations)):
+        auth.next_polling_account()
+        account_id, record = auth.get_active_account_snapshot()
+        safe_record = dict(record) if isinstance(record, Mapping) else {}
+        if not auth._record_model_enabled(safe_record):
+            continue
+        candidate_options = {
+            "_account_id": str(account_id or ""),
+            "_auth_token": str(safe_record.get("token") or ""),
+        }
+        account_key = _retry_account_key(candidate_options, rotation_index)
+        if account_key not in attempted_accounts:
+            return str(account_id or ""), safe_record
+    return None
+
+
+async def _run_web_with_retry(
+    messages,
+    model,
+    stream: bool,
+    options: Optional[dict] = None,
+    *,
+    tracker: Optional[_UsageTracker] = None,
+):
+    """web 上游 429 并发限制时轮询切换账号重试。"""
+    tracker = tracker or _USAGE_TRACKER.get()
+    if auth.get_polling_status().get("enabled"):
+        attempts = _polling_retry_limit(options)
+        attempted_accounts: set[str] = set()
+        for attempt_index in range(attempts):
+            account_key = _retry_account_key(options, attempt_index)
+            if account_key in attempted_accounts:
+                break
+            attempted_accounts.add(account_key)
+            try:
+                return await run_web_session(messages, model, stream, options)
+            except RuntimeError as e:
+                err = str(e)
+                if "solo_agent_parallel_limit" in err or "429" in err:
+                    if attempt_index + 1 >= attempts:
+                        break
+                    logger.warning("web 429 parallel limit, rotating account: %s", err)
+                    next_snapshot = _next_retry_account_snapshot(
+                        attempted_accounts, attempts
+                    )
+                    if next_snapshot is None:
+                        break
+                    # Rebind options from the newly rotated account so the
+                    # retry uses the correct token and billing identity.
+                    account_id, record = next_snapshot
+                    token = str(record.get("token") or "")
+                    billing_id = _account_id_from_token(token) or account_id
+                    provider_specific = (
+                        record.get("provider_specific")
+                        or record.get("providerSpecificData")
+                        or {}
+                    )
+                    options = dict(options or {})
+                    options["_account_id"] = account_id
+                    options["_billing_id"] = billing_id
+                    options["_auth_token"] = token
+                    options["_auth_user_id"] = billing_id
+                    if isinstance(provider_specific, Mapping):
+                        options["provider_specific"] = dict(provider_specific)
+                    if tracker is not None:
+                        await tracker.rebind(options)
+                    _rebind_chat_session_account(
+                        str(options.get("session_id") or options.get("sessionId") or ""),
+                        account_id,
+                        billing_id,
+                        token,
+                        provider_specific,
+                    )
+                    continue
+                raise
+        raise RuntimeError("All web accounts busy: Trae parallel limit reached")
+    return await run_web_session(messages, model, stream, options)
+
+
+async def _run_remote_with_retry(
+    messages,
+    model,
+    stream,
+    options: Optional[dict] = None,
+    *,
+    tracker: Optional[_UsageTracker] = None,
+):
+    """Retry 9router-style remote sessions on the provider's parallel limit."""
+    tracker = tracker or _USAGE_TRACKER.get()
+    if auth.get_polling_status().get("enabled"):
+        attempts = _polling_retry_limit(options)
+        attempted_accounts: set[str] = set()
+
+        async def rotate_remote_account(reason: str) -> bool:
+            nonlocal options
+            logger.warning("remote %s, rotating account", reason)
+            next_snapshot = _next_retry_account_snapshot(
+                attempted_accounts, attempts
+            )
+            if next_snapshot is None:
+                return False
+            account_id, record = next_snapshot
+            token = str(record.get("token") or "")
+            billing_id = _account_id_from_token(token) or account_id
+            provider_specific = (
+                record.get("provider_specific")
+                or record.get("providerSpecificData")
+                or {}
+            )
+            options = dict(options or {})
+            options["_account_id"] = account_id
+            options["_billing_id"] = billing_id
+            options["_auth_token"] = token
+            options["_auth_user_id"] = billing_id
+            if isinstance(provider_specific, Mapping):
+                options["provider_specific"] = dict(provider_specific)
+            if tracker is not None:
+                await tracker.rebind(options)
+            _rebind_chat_session_account(
+                str(options.get("session_id") or options.get("sessionId") or ""),
+                account_id,
+                billing_id,
+                token,
+                provider_specific,
+            )
+            return True
+
+        for attempt_index in range(attempts):
+            account_key = _retry_account_key(options, attempt_index)
+            if account_key in attempted_accounts:
+                break
+            attempted_accounts.add(account_key)
+            try:
+                return await run_remote_session(messages, model, stream, options)
+            except EmptyUpstreamResponse as exc:
+                if not exc.retryable or attempt_index + 1 >= attempts:
+                    raise
+                if not await rotate_remote_account(
+                    "upstream returned an empty response"
+                ):
+                    raise
+                continue
+            except RuntimeError as exc:
+                message = str(exc)
+                lowered = message.lower()
+                unavailable = (
+                    "remote model is not available for the bound account" in lowered
+                    or "model binding mismatch" in lowered
+                )
+                if unavailable:
+                    # Model entitlements differ per account. A bound account
+                    # missing the requested model is not a request failure;
+                    # rotate to the next polling account that can serve it.
+                    reason = "model unavailable on bound account"
+                elif "parallel" in lowered or "429" in lowered:
+                    reason = "parallel limit"
+                else:
+                    raise
+                if attempt_index + 1 >= attempts:
+                    if unavailable:
+                        raise
+                    break
+                if not await rotate_remote_account(reason):
+                    if unavailable:
+                        raise
+                    break
+                continue
+        raise RuntimeError("All remote accounts busy: Trae parallel limit reached")
+    return await run_remote_session(messages, model, stream, options)
+
+
+def _normalize_usage_record(record: Mapping[str, Any]) -> dict[str, Any]:
+    normalized = dict(record)
+    values = _usage_values(record)
+    prompt = values["prompt_tokens"]
+    completion = values["completion_tokens"]
+    total = values["total_tokens"] or prompt + completion
+    credits = values.get("credits_consumed")
+    requested_effort = (
+        record.get("reasoning_effort")
+        or record.get("requested_reasoning_effort")
+        or record.get("reasoning_effort_requested")
+        or record.get("thinking_effort")
+    )
+    applied_effort = (
+        record.get("reasoning_effort_applied")
+        or record.get("applied_reasoning_effort")
+        or record.get("native_reasoning_effort")
+    )
+    requested_context = (
+        record.get("context_mode_requested")
+        or record.get("requested_context_mode")
+    )
+    context_mode = (
+        record.get("context_mode")
+        or record.get("contextMode")
+        or record.get("context_window_mode")
+    )
+    actual_context_mode = (
+        record.get("context_mode_actual")
+        or record.get("actual_context_mode")
+    )
+    # Older rows recorded the requested standard profile but did not persist
+    # an explicit actual/max result.  Standard is deterministic in that case:
+    # expose it as an actual non-Max request instead of rendering ``--`` in
+    # the console.  Unknown/custom profiles remain unknown.
+    requested_context_bool = _context_mode_bool(requested_context)
+    if context_mode in (None, "") and requested_context_bool is False:
+        context_mode = "standard"
+    if actual_context_mode in (None, "") and requested_context_bool is False:
+        actual_context_mode = "standard"
+    max_applied = _optional_bool(record.get("max_mode_applied"))
+    if max_applied is None:
+        max_applied = _optional_bool(record.get("max_mode_enabled"))
+    if max_applied is None:
+        max_applied = _optional_bool(record.get("max_mode"))
+    if context_mode in (None, "") and max_applied is not None:
+        context_mode = "max_1m" if max_applied else "standard"
+    if context_mode in (None, "") and actual_context_mode not in (None, ""):
+        context_mode = actual_context_mode
+    if actual_context_mode in (None, "") and max_applied is not None:
+        actual_context_mode = "max_1m" if max_applied else "standard"
+    if actual_context_mode in (None, "") and context_mode not in (None, ""):
+        actual_context_mode = context_mode
+    # Keep explicit boolean metadata alongside the human-readable context
+    # fields.  The booleans are easier for API clients and daily aggregation
+    # to consume, while the legacy fields remain available for old consoles.
+    max_mode_requested = _optional_bool(
+        record.get("max_mode_requested")
+        if "max_mode_requested" in record
+        else None
+    )
+    if max_mode_requested is None and requested_context not in (None, ""):
+        max_mode_requested = _context_mode_bool(requested_context)
+    if max_mode_requested is None and "max_mode" in record:
+        max_mode_requested = _optional_bool(record.get("max_mode"))
+    max_mode_enabled = _optional_bool(
+        record.get("max_mode_enabled")
+        if "max_mode_enabled" in record
+        else None
+    )
+    if max_mode_enabled is None:
+        max_mode_enabled = max_applied
+    if max_mode_enabled is None and actual_context_mode not in (None, ""):
+        max_mode_enabled = _context_mode_bool(actual_context_mode)
+    tool_used = _optional_bool(record.get("tool_used"))
+    tools_requested = _optional_bool(
+        record.get("tools_requested")
+        if "tools_requested" in record
+        else record.get("tool_protocol_requested")
+    )
+    tool_calls_returned = _optional_bool(
+        record.get("tool_calls_returned")
+        if "tool_calls_returned" in record
+        else record.get("tool_call_returned")
+    )
+    tool_called = _optional_bool(
+        record.get("tool_called") if "tool_called" in record else None
+    )
+    if tool_called is None:
+        # ``tool_used`` is the canonical actual-result marker in v1.0.2;
+        # ``tool_calls_returned`` is retained for compatibility with rows
+        # written by the stream parser.
+        tool_called = tool_used
+    if tool_called is None:
+        tool_called = tool_calls_returned
+    context_window_tokens = _number_value(
+        record.get("context_window_tokens")
+        or record.get("max_context_tokens")
+    )
+    usage_turn_id = str(
+        record.get("usage_turn_id")
+        or record.get("billing_turn_id")
+        or record.get("_usage_turn_id")
+        or ""
+    ).strip() or None
+    normalized.update(
+        {
+            "account_id": str(record.get("account_id") or "default"),
+            "model": str(record.get("model") or "auto"),
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "input_tokens": prompt,
+            "output_tokens": completion,
+            "total_tokens": total,
+            "cached_tokens": int(values.get("cached_tokens") or 0),
+            "tokens_source": str(
+                record.get("tokens_source")
+                or (
+                    "upstream"
+                    if any(
+                        key in record
+                        for key in (
+                            "prompt_tokens",
+                            "completion_tokens",
+                            "input_tokens",
+                            "output_tokens",
+                            "total_tokens",
+                        )
+                    )
+                    else "unknown"
+                )
+            ),
+            "credits_consumed": _credit_round(credits),
+            "credits_source": str(
+                record.get("credits_source")
+                or ("upstream" if credits is not None else "unknown")
+            ),
+            # Keep only the opaque upstream turn id needed for delayed billing
+            # enrichment. Credentials and token payloads are never persisted.
+            "usage_turn_id": usage_turn_id,
+            "request_id": str(record.get("request_id") or ""),
+            "endpoint": record.get("endpoint") or None,
+            "stream": record.get("stream") if "stream" in record else None,
+            "status": str(record.get("status") or "completed"),
+            "duration_ms": _number_value(record.get("duration_ms")),
+            "timestamp": _number_value(record.get("timestamp")) or 0,
+            # Request metadata is kept separate from token accounting so old
+            # rows can still be rendered with an explicit unknown marker.
+            "reasoning_effort": (
+                str(requested_effort).strip()
+                if requested_effort not in (None, "")
+                else None
+            ),
+            "requested_reasoning_effort": (
+                str(requested_effort).strip()
+                if requested_effort not in (None, "")
+                else None
+            ),
+            "reasoning_effort_applied": (
+                str(applied_effort).strip()
+                if applied_effort not in (None, "")
+                else None
+            ),
+            "context_mode_requested": (
+                str(requested_context).strip()
+                if requested_context not in (None, "")
+                else None
+            ),
+            "context_mode": (
+                str(context_mode).strip()
+                if context_mode not in (None, "")
+                else None
+            ),
+            "context_mode_actual": (
+                str(actual_context_mode).strip()
+                if actual_context_mode not in (None, "")
+                else None
+            ),
+            "context_window_tokens": context_window_tokens,
+            "max_mode_applied": max_applied,
+            "max_mode_requested": max_mode_requested,
+            "max_mode_enabled": max_mode_enabled,
+            # Stable aliases for API clients and older frontends.  The
+            # canonical fields above retain the requested-vs-actual
+            # distinction; these aliases represent the actual observed
+            # capability when it is known.
+            "max_mode": max_mode_enabled,
+            "tools_requested": tools_requested,
+            "tool_used": tool_used,
+            "tool_calls_returned": tool_calls_returned,
+            "tool_called": tool_called,
+            "tool": tool_called,
+        }
+    )
+    return normalized
+
+
+def _public_usage_record(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a usage row without exposing the upstream billing correlation id."""
+
+    normalized = _normalize_usage_record(record)
+    normalized.pop("usage_turn_id", None)
+    normalized.pop("billing_turn_id", None)
+    normalized.pop("_usage_turn_id", None)
+    return normalized
+
+
+def _save_usage_history_locked() -> None:
+    try:
+        _USAGE_RECORDS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": 1,
+            "records": _USAGE_HISTORY[:_USAGE_MAX_HISTORY],
+        }
+        temporary = _USAGE_RECORDS_PATH.with_name(
+            _USAGE_RECORDS_PATH.name + ".tmp"
+        )
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            "utf-8",
+        )
+        os.replace(temporary, _USAGE_RECORDS_PATH)
+    except Exception as exc:
+        logger.warning("usage records could not be saved: %s", exc)
+
+
+def _load_usage_history() -> None:
+    global _USAGE_HISTORY
+    try:
+        if not _USAGE_RECORDS_PATH.exists():
+            return
+        payload = json.loads(_USAGE_RECORDS_PATH.read_text("utf-8"))
+        records = payload.get("records", []) if isinstance(payload, dict) else payload
+        if not isinstance(records, list):
+            raise ValueError("usage records must be a list")
+        normalized = [
+            _normalize_usage_record(record)
+            for record in records
+            if isinstance(record, Mapping)
+        ][:_USAGE_MAX_HISTORY]
+        with _USAGE_LOCK:
+            _USAGE_HISTORY = normalized
+    except Exception as exc:
+        logger.warning("usage records could not be loaded: %s", exc)
+
+
+def _usage_day(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp, _CHECKIN_TIMEZONE).strftime("%Y-%m-%d")
+
+
+def _empty_usage_bucket() -> dict[str, Any]:
+    bucket: dict[str, Any] = {key: 0 for key in _USAGE_STATS_FIELDS}
+    bucket["credits"] = 0.0
+    bucket["models"] = {}
+    return bucket
+
+
+def _usage_contribution(record: Mapping[str, Any]) -> dict[str, Any]:
+    status = str(record.get("status") or "completed")
+    credits = _number_value(record.get("credits_consumed"))
+    return {
+        "model": str(record.get("model") or "auto"),
+        "requests": 1,
+        "completed": 1 if status == "completed" else 0,
+        "failed": 1 if status == "error" else 0,
+        "input_tokens": int(record.get("input_tokens") or 0),
+        "output_tokens": int(record.get("output_tokens") or 0),
+        "cached_tokens": int(record.get("cached_tokens") or 0),
+        "total_tokens": int(record.get("total_tokens") or 0),
+        "credits": float(credits or 0),
+        "max_mode_requests": 1
+        if _optional_bool(record.get("max_mode_requested")) is True
+        else 0,
+        "max_mode_enabled_requests": 1
+        if _optional_bool(record.get("max_mode_enabled")) is True
+        else 0,
+        "tool_requests": 1
+        if _optional_bool(record.get("tools_requested")) is True
+        else 0,
+        "tool_calls": 1
+        if _optional_bool(record.get("tool_called")) is True
+        else 0,
+    }
+
+
+def _apply_usage_contribution_locked(
+    day: str, contribution: Mapping[str, Any], sign: int
+) -> None:
+    days = _USAGE_STATS.setdefault("days", {})
+    bucket = days.setdefault(day, _empty_usage_bucket())
+    for key in _USAGE_STATS_FIELDS:
+        value = bucket.get(key, 0) + sign * contribution.get(key, 0)
+        bucket[key] = max(0, round(value, 4) if key == "credits" else int(value))
+    models = bucket.setdefault("models", {})
+    model = contribution.get("model") or "auto"
+    entry = models.setdefault(
+        model, {"requests": 0, "input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    )
+    for key in ("requests", "input_tokens", "output_tokens", "total_tokens"):
+        entry[key] = max(0, int(entry.get(key, 0) + sign * contribution.get(key, 0)))
+    if entry["requests"] == 0:
+        models.pop(model, None)
+    if len(days) > _USAGE_STATS_MAX_DAYS:
+        for stale in sorted(days)[: len(days) - _USAGE_STATS_MAX_DAYS]:
+            days.pop(stale, None)
+
+
+def _usage_stats_replace_locked(
+    previous: Mapping[str, Any] | None, record: Mapping[str, Any]
+) -> None:
+    """Move one request's contribution from its previous form to ``record``.
+
+    Records are rewritten in place (same request id) when retries settle or
+    credits are enriched later; subtracting the old row keeps totals exact.
+    """
+    if previous is not None:
+        day = _usage_day(float(previous.get("timestamp") or 0) or time.time())
+        _apply_usage_contribution_locked(day, _usage_contribution(previous), -1)
+    day = _usage_day(float(record.get("timestamp") or 0) or time.time())
+    _apply_usage_contribution_locked(day, _usage_contribution(record), 1)
+    _save_usage_stats_locked()
+
+
+def _usage_stats_path() -> Path:
+    # Sits next to usage_records.json unless explicitly overridden, so a
+    # relocated records path (tests, alternate data dirs) moves both files.
+    if _USAGE_STATS_PATH_OVERRIDE:
+        return Path(_USAGE_STATS_PATH_OVERRIDE)
+    return _USAGE_RECORDS_PATH.with_name("usage_stats.json")
+
+
+def _save_usage_stats_locked() -> None:
+    try:
+        path = _usage_stats_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"version": 1, "days": _USAGE_STATS.get("days", {})}
+        temporary = path.with_name(path.name + ".tmp")
+        temporary.write_text(json.dumps(payload, ensure_ascii=False) + "\n", "utf-8")
+        os.replace(temporary, path)
+    except Exception as exc:
+        logger.warning("usage stats could not be saved: %s", exc)
+
+
+def _load_usage_stats() -> None:
+    """Load daily totals, seeding them once from the request history."""
+    global _USAGE_STATS
+    try:
+        path = _usage_stats_path()
+        if path.exists():
+            payload = json.loads(path.read_text("utf-8"))
+            days = payload.get("days") if isinstance(payload, dict) else None
+            if not isinstance(days, dict):
+                raise ValueError("usage stats must contain a days mapping")
+            with _USAGE_LOCK:
+                _USAGE_STATS = {"days": days}
+            return
+        with _USAGE_LOCK:
+            _USAGE_STATS = {"days": {}}
+            for record in _USAGE_HISTORY:
+                day = _usage_day(float(record.get("timestamp") or 0) or time.time())
+                _apply_usage_contribution_locked(day, _usage_contribution(record), 1)
+            if _USAGE_HISTORY:
+                _save_usage_stats_locked()
+    except Exception as exc:
+        logger.warning("usage stats could not be loaded: %s", exc)
+
+
+def _usage_overview(days: int = 30) -> dict[str, Any]:
+    days = max(1, min(int(days or 30), 366))
+    now = time.time()
+    today = _usage_day(now)
+    with _USAGE_LOCK:
+        stored = json.loads(json.dumps(_USAGE_STATS.get("days", {})))
+    totals = _empty_usage_bucket()
+    totals.pop("models")
+    for bucket in stored.values():
+        for key in _USAGE_STATS_FIELDS:
+            totals[key] += bucket.get(key, 0)
+    totals["credits"] = round(totals["credits"], 2)
+    start = datetime.fromtimestamp(now, _CHECKIN_TIMEZONE).date()
+    daily = []
+    for offset in range(days):
+        day = (start - timedelta(days=offset)).strftime("%Y-%m-%d")
+        bucket = stored.get(day) or _empty_usage_bucket()
+        models = sorted(
+            (
+                {"model": name, **values}
+                for name, values in (bucket.get("models") or {}).items()
+            ),
+            key=lambda item: item.get("total_tokens", 0),
+            reverse=True,
+        )
+        daily.append(
+            {
+                "date": day,
+                **{key: bucket.get(key, 0) for key in _USAGE_STATS_FIELDS},
+                "credits": round(float(bucket.get("credits") or 0), 2),
+                "models": models[:6],
+            }
+        )
+    return {
+        "today": next((row for row in daily if row["date"] == today), daily[0]),
+        "totals": totals,
+        "active_days": sum(1 for bucket in stored.values() if bucket.get("requests")),
+        "first_day": min(stored) if stored else None,
+        "daily": daily,
+    }
+
+
+def _record_usage(
+    account_id: str,
+    model: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    *,
+    credits_consumed: int | float | None = None,
+    credits_source: str = "unknown",
+    usage_turn_id: str | None = None,
+    request_id: str = "",
+    endpoint: str | None = None,
+    stream: bool | None = None,
+    status: str = "completed",
+    duration_ms: int | float | None = None,
+    tokens_source: str = "upstream",
+    cached_tokens: int = 0,
+    reasoning_effort: str | None = None,
+    requested_reasoning_effort: str | None = None,
+    reasoning_effort_applied: str | None = None,
+    context_mode_requested: str | None = None,
+    context_mode: str | None = None,
+    context_mode_actual: str | None = None,
+    context_window_tokens: int | float | None = None,
+    max_mode_applied: bool | None = None,
+    max_mode_requested: bool | None = None,
+    max_mode_enabled: bool | None = None,
+    tools_requested: bool | None = None,
+    tool_used: bool | None = None,
+    tool_calls_returned: bool | None = None,
+    tool_called: bool | None = None,
+) -> dict[str, Any]:
+    """Record one API request (newest first) and persist it independently."""
+    global _USAGE_HISTORY
+    record = _normalize_usage_record(
+        {
+            "account_id": account_id,
+            "model": model,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+            "cached_tokens": cached_tokens,
+            "tokens_source": tokens_source,
+            "credits_consumed": credits_consumed,
+            "credits_source": credits_source,
+            "usage_turn_id": usage_turn_id,
+            "request_id": request_id,
+            "endpoint": endpoint,
+            "stream": stream,
+            "status": status,
+            "duration_ms": duration_ms,
+            "timestamp": time.time(),
+            "reasoning_effort": reasoning_effort,
+            "requested_reasoning_effort": requested_reasoning_effort,
+            "reasoning_effort_applied": reasoning_effort_applied,
+            "context_mode_requested": context_mode_requested,
+            "context_mode": context_mode,
+            "context_mode_actual": context_mode_actual,
+            "context_window_tokens": context_window_tokens,
+            "max_mode_applied": max_mode_applied,
+            "max_mode_requested": max_mode_requested,
+            "max_mode_enabled": max_mode_enabled,
+            "tools_requested": tools_requested,
+            "tool_used": tool_used,
+            "tool_calls_returned": tool_calls_returned,
+            "tool_called": tool_called,
+        }
+    )
+    with _USAGE_LOCK:
+        previous = None
+        if request_id:
+            for index, existing in enumerate(_USAGE_HISTORY):
+                if existing.get("request_id") == request_id:
+                    previous = existing
+                    # Keep the original day bucket for a rewritten request.
+                    record["timestamp"] = existing.get("timestamp") or record["timestamp"]
+                    _USAGE_HISTORY[index] = record
+                    break
+            else:
+                _USAGE_HISTORY.insert(0, record)
+        else:
+            _USAGE_HISTORY.insert(0, record)
+        _usage_stats_replace_locked(previous, record)
+        if len(_USAGE_HISTORY) > _USAGE_MAX_HISTORY:
+            _USAGE_HISTORY = _USAGE_HISTORY[:_USAGE_MAX_HISTORY]
+        _save_usage_history_locked()
+    return record
+
+
+def _upstream_response_error(response: Any) -> str:
+    """Return a concise error for an upstream response, or ``""``.
+
+    Adapters normally raise on non-2xx responses, but a few native bridges
+    return a JSON error response instead.  Treat both forms uniformly so the
+    dispatcher can continue to the configured Remote fallback.
+    """
+
+    status = int(getattr(response, "status_code", 200) or 200)
+    if status < 400:
+        return ""
+    payload = _response_json_payload(response)
+    error = payload.get("error") if isinstance(payload, Mapping) else None
+    if isinstance(error, Mapping):
+        message = str(error.get("message") or "").strip()
+    else:
+        message = str(error or "").strip()
+    return f"HTTP {status}: {message or 'upstream returned an error'}"
+
+
+def _remote_fallback_options(
+    options: Optional[Mapping[str, Any]], requested_mode: str
+) -> dict[str, Any]:
+    """Build options for a native-endpoint -> Remote fallback attempt."""
+
+    fallback = dict(options or {})
+    fallback["_upstream_mode"] = "remote"
+    fallback["_upstream_fallback_from"] = requested_mode
+    # ``work-agent`` is a selectable Work tier, but its fallback must be the
+    # ordinary Remote/Agent tier.  Carrying ``solo_work_remote`` (or
+    # ``_trae_mode=work``) here only changes the log label while issuing a
+    # second Work request, which is why the UI appeared to "fall back to
+    # Remote" without ever leaving Work.  Native TraeWork compatibility modes
+    # retain their historical Work-tier fallback because they are separate
+    # helper transports.
+    if requested_mode == "work-agent":
+        fallback.pop("_trae_mode", None)
+        fallback.pop("_remote_agent_type", None)
+        fallback.pop("remote_agent_type", None)
+        fallback["_remote_agent_type"] = "solo_agent_remote"
+    elif not (
+        fallback.get("_remote_agent_type")
+        or fallback.get("remote_agent_type")
+    ):
+        fallback_agent_type = (
+            "solo_work_remote"
+            if requested_mode in {
+                "traework-native",
+                "native",
+                "traework",
+            }
+            else "solo_agent_remote"
+        )
+        fallback["_remote_agent_type"] = fallback_agent_type
+    fallback.setdefault("_session_variant", f"{requested_mode}-fallback")
+    return fallback
+
+
+def _update_usage_record(request_id: str, **updates: Any) -> None:
+    if not request_id:
+        return
+    with _USAGE_LOCK:
+        for index, existing in enumerate(_USAGE_HISTORY):
+            if existing.get("request_id") != request_id:
+                continue
+            merged = dict(existing)
+            merged.update(updates)
+            # Round credit fields before normalizing
+            for key in ("credits_consumed", "credits_before", "credits_after"):
+                if key in merged:
+                    merged[key] = _credit_round(merged[key])
+            _USAGE_HISTORY[index] = _normalize_usage_record(merged)
+            _usage_stats_replace_locked(existing, _USAGE_HISTORY[index])
+            _save_usage_history_locked()
+            return
+
+
+# Raw v2 answers ``2001 failed to get app config: record not found`` when the
+# account has no enterprise app config.  That is deterministic, so remember it
+# briefly and route straight to the next candidate instead of paying the
+# round-trip on every request.
+_RAW_APP_CONFIG_MISSING: dict[str, float] = {}
+_RAW_APP_CONFIG_TTL_SECONDS = 600.0
+
+
+def _raw_app_config_missing_error(error: Any) -> bool:
+    text = str(error or "").lower()
+    return "app config" in text and "record not found" in text
+
+
+def _raw_app_config_key(model: Any, options: Mapping) -> str:
+    return f"{options.get('_account_id') or 'default'}|{str(model or '').lower()}"
+
+
+def _raw_app_config_known_missing(model: Any, options: Mapping) -> bool:
+    if not options.get("_account_id"):
+        return False
+    key = _raw_app_config_key(model, options)
+    expires = _RAW_APP_CONFIG_MISSING.get(key)
+    if not expires:
+        return False
+    if expires < time.monotonic():
+        _RAW_APP_CONFIG_MISSING.pop(key, None)
+        return False
+    return True
+
+
+AUTO_ROUTE_MODE = "auto-route"
+# Endpoints chosen by auto routing. IDE Agent passes the full tool suite
+# (including parallel calls); Remote is the general chat path and the final
+# fallback for everything.
+AUTO_ROUTE_TOOL_ENDPOINT = "ide"
+AUTO_ROUTE_CHAT_ENDPOINT = "remote"
+
+
+def _auto_route_enabled() -> bool:
+    try:
+        return bool(auth.get_auto_route_settings().get("enabled"))
+    except Exception:
+        return False
+
+
+def _apply_auto_route(
+    messages: Optional[list[dict]], options: Optional[dict]
+) -> dict:
+    """Resolve the endpoint for one request when auto routing applies.
+
+    Auto routing runs when the caller asked for ``auto-route`` explicitly, or
+    when the console switch is on and the request carries no explicit
+    endpoint.  Tool requests (tool definitions or tool history) go to IDE
+    Agent, plain chat goes to Remote; the dispatcher's existing fallback then
+    lands on Remote if the chosen endpoint fails.
+    """
+
+    options = dict(options or {})
+    explicit = str(options.get("_upstream_mode") or "").strip().lower()
+    if explicit and explicit != AUTO_ROUTE_MODE:
+        return options
+    if options.get("_traework_custom_model"):
+        return options
+    if not explicit:
+        if not _auto_route_enabled():
+            return options
+        # Local CLI / native helper modes are host-specific; leave them alone.
+        if _current_upstream_mode() in (
+            "cli", "traework-native", "native", "traework"
+        ):
+            return options
+    uses_tools = _tool_protocol_requested(options, messages)
+    endpoint = AUTO_ROUTE_TOOL_ENDPOINT if uses_tools else AUTO_ROUTE_CHAT_ENDPOINT
+    options["_upstream_mode"] = endpoint
+    options["_auto_route"] = "tools" if uses_tools else "chat"
+    trace = options.get("_upstream_trace")
+    if isinstance(trace, dict):
+        trace.update(auto_route=True, auto_route_reason=options["_auto_route"])
+    logger.info(
+        "auto route id=%s model_request=%s endpoint=%s",
+        str(options.get("_relay_request_id") or ""),
+        options["_auto_route"],
+        endpoint,
+    )
+    return options
+
+
+def _trace_failure_reason(endpoint: str, error: Any) -> str:
+    """Return a bounded, readable endpoint failure diagnostic."""
+
+    detail = str(error or "upstream request failed").strip().replace("\r", " ").replace("\n", " ")
+    if len(detail) > 400:
+        detail = detail[:397] + "..."
+    return f"{endpoint}: {detail}" if endpoint else detail
+
+
+def _trace_append_failure(trace: Any, endpoint: str, error: Any) -> None:
+    """Append one endpoint failure to the request trace without duplication."""
+
+    if not isinstance(trace, dict):
+        return
+    item = _trace_failure_reason(endpoint, error)
+    previous = str(trace.get("fallback_reason") or "").strip()
+    parts = [part.strip() for part in previous.split(";") if part.strip()]
+    if item not in parts:
+        parts.append(item)
+    trace["fallback_reason"] = "; ".join(parts)[:1200]
+    if endpoint:
+        failed = [part.strip() for part in str(trace.get("failed_endpoint") or "").split(",") if part.strip()]
+        if endpoint not in failed:
+            failed.append(endpoint)
+        trace["failed_endpoint"] = ",".join(failed)
+
+
+async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] = None):
+    options = _apply_auto_route(messages, options)
+    try:
+        _ensure_model_account_enabled(
+            str(options.get("_account_id") or ""),
+            str(options.get("_auth_token") or ""),
+        )
+    except _ModelAccountUnavailable as exc:
+        return _openai_error(503, str(exc), "model_account_unavailable")
+    active_mode = str(options.get("_upstream_mode") or _current_upstream_mode()).lower()
+    trace = options.get("_upstream_trace")
+    fallback_from = str(options.get("_upstream_fallback_from") or "").strip().lower()
+    if isinstance(trace, dict):
+        if fallback_from:
+            # A streaming/native fallback re-enters this dispatcher with the
+            # same trace object. Preserve the original requested endpoint and
+            # reason while updating the current target.
+            trace.setdefault("requested_mode", fallback_from)
+            trace.setdefault("requested_endpoint", fallback_from)
+            trace.update(
+                actual_mode="",
+                actual_endpoint="",
+                fallback_used=True,
+                fallback_target=active_mode,
+            )
+        else:
+            trace.update(
+                requested_mode=active_mode,
+                requested_endpoint=active_mode,
+                actual_mode="",
+                actual_endpoint="",
+                fallback_used=False,
+                fallback_reason="",
+                fallback_target="",
+                failed_endpoint="",
+            )
+    logger.info(
+        "dispatch start model=%s stream=%s messages=%d last_role=%s last_chars=%d "
+        "tools=%s session=%s",
+        model,
+        stream,
+        len(messages or []),
+        (messages[-1].get("role") if messages and isinstance(messages[-1], Mapping) else ""),
+        (len(str(messages[-1].get("content") or "")) if messages and isinstance(messages[-1], Mapping) else 0),
+        _tool_protocol_requested(options, messages),
+        str(options.get("session_id") or options.get("sessionId") or "")[:16],
+    )
+    if not str(model or "").strip():
+        return _openai_error(
+            400,
+            "model is required and cannot be blank",
+            "invalid_request_error",
+            "model",
+        )
+    if not trae_client.is_model_supported(model):
+        return _openai_error(400, f"Unsupported model: {model}", "invalid_request_error", "model")
+
+    # TraeWork's custom-model adapter is a separate ingress contract while the
+    # actual file/shell tools remain owned by the Windows client. The official
+    # raw endpoint currently returns a business authentication error for these
+    # account credentials, so the verified remote transport is the default.
+    # Keep raw/direct as explicit diagnostics instead of advertising a fallback
+    # that cannot catch errors raised later by a StreamingResponse iterator.
+    if options.get("_traework_custom_model"):
+        custom_mode = str(
+            options.get("_traework_upstream_mode")
+            or os.environ.get("TRAEWORK_CUSTOM_UPSTREAM_MODE", "remote")
+        ).strip().lower()
+        if custom_mode in {"raw", "direct", "auto"}:
+            logger.info(
+                "dispatch TraeWork custom-model ingress id=%s mode=raw model=%s",
+                str(options.get("_relay_request_id") or ""),
+                model,
+            )
+            return await run_raw_chat(messages, model, stream, options)
+        if custom_mode in {"remote", "web"}:
+            logger.info(
+                "dispatch TraeWork custom-model ingress id=%s mode=%s model=%s",
+                str(options.get("_relay_request_id") or ""),
+                custom_mode,
+                model,
+            )
+            if custom_mode == "web":
+                return await _run_web_with_retry(messages, model, stream, options)
+            return await _run_remote_with_retry(messages, model, stream, options)
+        raise RuntimeError(
+            "Unsupported TRAEWORK_CUSTOM_UPSTREAM_MODE: " + custom_mode
+        )
+
+    # External tools always execute on the API caller.  Web/IDE agent routes
+    # may execute their own tools on the relay host, so they are never valid
+    # fallbacks for a request that advertises caller-owned tools.
+    tool_protocol_requested = _tool_protocol_requested(options, messages)
+    # Caller-owned tools are now supported on all upstream paths.
+    # Remote/web routes inject tool definitions as a system prompt via
+    # `_messages_with_client_runtime` and filter tool calls from the
+    # upstream text response with `_filter_tool_calls`.
+    if tool_protocol_requested:
+        logger.info(
+            "dispatch tool protocol id=%s mode=%s model=%s",
+            str(options.get("_relay_request_id") or ""),
+            active_mode,
+            model,
+        )
+
+    # Raw v2 is the default for every model. Operators can opt specific models
+    # (or ``*``) into the account-bound remote executor for diagnostics.
+    if not options.get("_disable_upstream_fallback") and _requires_remote_model(model) and active_mode in (
+        "raw",
+        "direct",
+        "auto",
+        "ide",
+        "solo",
+    ):
+        logger.info(
+            "dispatch remote-only model id=%s model=%s account=%s",
+            str(options.get("_relay_request_id") or ""),
+            model,
+            str(options.get("_account_id") or "default"),
+        )
+        try:
+            if isinstance(trace, dict):
+                trace.update(
+                    actual_mode="remote",
+                    actual_endpoint="remote",
+                    fallback_used=True,
+                    fallback_target="remote",
+                )
+                _trace_append_failure(
+                    trace,
+                    active_mode,
+                    "model is configured for the Remote executor",
+                )
+            return await _run_remote_with_retry(messages, model, stream, options)
+        except ModelProviderMismatch as exc:
+            _trace_append_failure(trace, "remote", exc)
+            logger.error(
+                "remote provider model mismatch id=%s requested=%s error=%s",
+                str(options.get("_relay_request_id") or ""),
+                model,
+                exc,
+            )
+            return _openai_error(502, str(exc), "upstream_model_mismatch", "model")
+
+    # ``auto`` is the direct-proxy mode: every model request reaches Trae's
+    # native llm_utils_chat endpoint. Legacy modes remain explicit opt-ins for
+    # diagnostics, but they are never silent fallbacks for API traffic.
+    errors = []
+    fallback_reasons: list[str] = []
+    modes = []
+    if active_mode == "cli":
+        modes = ["cli"]
+    elif active_mode in ("raw", "direct"):
+        modes = ["raw"]
+    elif active_mode in ("remote", "9router", "trae-remote"):
+        modes = ["remote"]
+    elif active_mode == "web":
+        modes = ["web"]
+    elif active_mode in ("ide", "solo"):
+        modes = [active_mode]
+    elif active_mode == "work-agent":
+        modes = ["work-agent"]
+    elif active_mode in ("traework-native", "native", "traework"):
+        modes = ["traework-native"]
+    else:
+        modes = ["raw"]
+
+    # Native IDE/Work/Raw paths are useful diagnostics, but the current CN
+    # gateway does not expose all three paths for every account.  Keep the
+    # selected path first and automatically try the verified Remote transport
+    # for both plain and caller-owned-tool requests.  The old implementation
+    # excluded tool requests here, which turned a transient native rejection
+    # into a guaranteed 502 for Codex clients.
+    fallback_enabled = not bool(options.get("_disable_upstream_fallback"))
+    fallback_modes = {
+        "raw",
+        "direct",
+        "auto",
+        "ide",
+        "solo",
+        "work-agent",
+        "traework-native",
+        "native",
+        "traework",
+    }
+    if fallback_enabled and active_mode in ("raw", "direct"):
+        modes.append("ide")
+    if fallback_enabled and active_mode in fallback_modes and "remote" not in modes:
+        modes.append("remote")
+    route_initial_mode = modes[0] if modes else active_mode
+    raw_skipped = False
+    if (
+        fallback_enabled
+        and modes[:1] == ["raw"]
+        and len(modes) > 1
+        and _raw_app_config_known_missing(model, options)
+    ):
+        skip_detail = "skipped (app config record not found, cached)"
+        skip_reason = f"raw: {skip_detail}"
+        errors.append(skip_reason)
+        fallback_reasons.append(skip_reason)
+        _trace_append_failure(trace, "raw", skip_detail)
+        raw_skipped = True
+        modes = modes[1:]
+
+    logger.info(
+        "dispatch route id=%s mode=%s candidates=%s tool_protocol=%s",
+        str(options.get("_relay_request_id") or ""),
+        active_mode,
+        ",".join(modes),
+        tool_protocol_requested,
+    )
+
+    for mode in modes:
+        try:
+            if isinstance(trace, dict):
+                route_fallback = (
+                    bool(fallback_from)
+                    or bool(fallback_reasons)
+                    or raw_skipped
+                    or mode != route_initial_mode
+                )
+                trace.update(
+                    actual_mode=mode,
+                    actual_endpoint=mode,
+                    fallback_used=route_fallback,
+                )
+                if route_fallback:
+                    trace["fallback_target"] = (
+                        "remote-work" if mode == "work-agent" else mode
+                    )
+                    if fallback_reasons:
+                        trace["fallback_reason"] = "; ".join(fallback_reasons)[:1200]
+                trace.pop("reasoning_effort_applied", None)
+                trace.pop("max_context_tokens", None)
+                if mode in {"raw", "ide", "solo", "cli", "traework-native", "web"}:
+                    trace["max_mode_applied"] = False
+                else:
+                    trace.pop("max_mode_applied", None)
+            mode_options = dict(options)
+            if mode == "raw":
+                result = await run_raw_chat(messages, model, stream, mode_options)
+                error = _upstream_response_error(result)
+                if error:
+                    raise RuntimeError(f"raw returned {error}")
+                if isinstance(trace, dict) and (fallback_reasons or raw_skipped):
+                    trace["fallback_target"] = "raw"
+                return result
+            # Web and remote routes must receive the lease-bound credential;
+            # otherwise a concurrent account switch can make the upstream bill
+            # one token while the usage tracker records another.
+            if mode not in (
+                "remote",
+                "web",
+                "ide",
+                "solo",
+                "work-agent",
+                "traework-native",
+            ):
+                mode_options.pop("_auth_token", None)
+                mode_options.pop("_account_id", None)
+            if mode == "cli":
+                mode_options.pop("_upstream_trace", None)
+                result = await run_cli_chat(messages, model, stream, mode_options)
+                error = _upstream_response_error(result)
+                if error:
+                    raise RuntimeError(f"cli returned {error}")
+                return result
+            if mode == "web":
+                result = await _run_web_with_retry(messages, model, stream, mode_options)
+                error = _upstream_response_error(result)
+                if error:
+                    raise RuntimeError(f"web returned {error}")
+                return result
+            if mode == "remote":
+                if modes[0] != "remote":
+                    mode_options = _remote_fallback_options(
+                        mode_options, active_mode
+                    )
+                result = await _run_remote_with_retry(messages, model, stream, mode_options)
+                error = _upstream_response_error(result)
+                if error:
+                    raise RuntimeError(f"remote returned {error}")
+                return result
+            if mode == "work-agent":
+                mode_options["_trae_mode"] = "work"
+                mode_options["_remote_agent_type"] = "solo_work_remote"
+                mode_options.setdefault("_session_variant", "work-agent")
+                if isinstance(trace, dict):
+                    trace.update(actual_endpoint="remote-work")
+                result = await _run_remote_with_retry(
+                    messages, model, stream, mode_options
+                )
+                error = _upstream_response_error(result)
+                if error:
+                    raise RuntimeError(f"work-agent returned {error}")
+                return result
+            if mode == "traework-native":
+                result = await run_traework_native_chat(
+                    messages, model, stream, mode_options
+                )
+                error = _upstream_response_error(result)
+                if error:
+                    raise RuntimeError(f"traework-native returned {error}")
+                return result
+            if mode in ("ide", "solo"):
+                mode_options["_ide_endpoint"] = "/api/agent/v3/llm_utils_chat"
+            result = await run_ide_chat(messages, model, stream, mode_options)
+            if getattr(result, "status_code", 200) >= 400:
+                payload = _response_json_payload(result)
+                detail = payload.get("error") if isinstance(payload, Mapping) else None
+                detail = (
+                    detail.get("message")
+                    if isinstance(detail, Mapping)
+                    else str(detail or "upstream returned an error")
+                )
+                raise RuntimeError(
+                    f"{mode} returned HTTP {getattr(result, 'status_code', 0)}: {detail}"
+                )
+            return result
+        except Exception as e:
+            logger.warning("upstream %s failed: %s", mode, e)
+            reason = _trace_failure_reason(mode, e)
+            fallback_reasons.append(reason)
+            _trace_append_failure(trace, mode, e)
+            if isinstance(e, _ModelAccountUnavailable):
+                return _openai_error(503, str(e), "model_account_unavailable")
+            if isinstance(e, EmptyUpstreamResponse):
+                _track_usage_from_exception(e, model)
+                if not e.retryable or e.observed_model_event:
+                    if stream:
+                        raise
+                    return _openai_error(502, str(e), "api_error")
+            errors.append(f"{mode}: {e}")
+            if (
+                mode == "raw"
+                and options.get("_account_id")
+                and _raw_app_config_missing_error(e)
+            ):
+                _RAW_APP_CONFIG_MISSING[_raw_app_config_key(model, options)] = (
+                    time.monotonic() + _RAW_APP_CONFIG_TTL_SECONDS
+                )
+
+    return _openai_error(502, "All upstream paths failed: " + "; ".join(errors), "api_error")
+
+
+def _response_json_payload(response: Any) -> dict[str, Any]:
+    """Decode a Starlette JSON response without assuming a concrete class."""
+
+    body = getattr(response, "body", b"")
+    if isinstance(body, bytes):
+        body = body.decode("utf-8", errors="replace")
+    if isinstance(body, str):
+        try:
+            value = json.loads(body)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return dict(value) if isinstance(value, Mapping) else {}
+    return dict(body) if isinstance(body, Mapping) else {}
+
+
+async def _handle_traework_custom(
+    req: Request,
+    body: Optional[Mapping[str, Any]] = None,
+    *,
+    request_id: str = "",
+):
+    """Serve TraeWork's custom-model/raw ingress and preserve client tools.
+
+    The desktop client owns the toolhost. This endpoint only converts its raw
+    request into the existing relay dispatch and converts the OpenAI-shaped
+    result back to TraeWork's cumulative ``event: output`` stream. No tool is
+    executed in the relay container.
+    """
+
+    request_id = request_id or ("req-" + uuid_mod.uuid4().hex)
+    if body is None:
+        try:
+            body, _ = await _read_json_body(
+                req, endpoint="traework-custom", trace_id=request_id
+            )
+        except _RequestBodyError as exc:
+            return _openai_error(400, str(exc), "invalid_request_error")
+    try:
+        descriptor = traework_compat.normalize_inbound_request(
+            body,
+            headers=dict(req.headers),
+            path=req.url.path,
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        return _openai_error(400, str(exc), "invalid_request_error")
+
+    messages = cli_client.sanitize_assistant_history_messages(
+        _normalize_chat_messages(descriptor.messages)
+    )
+    options = dict(descriptor.options)
+    options = _apply_tool_header_hints(req, options)
+    options = _with_auto_client_context(req, body, messages, options)
+    options = _bind_chat_session(
+        messages,
+        options,
+        requested_session_id=descriptor.session_id,
+    )
+    # These values are deliberately set after session binding. The lease owns
+    # the account/JWT; the custom model's Bearer key must never replace it.
+    options["_traework_custom_model"] = True
+    options["_relay_request_id"] = request_id
+    tracker = _UsageTracker(
+        descriptor.model,
+        req.url.path,
+        descriptor.stream,
+        options,
+        messages,
+    )
+    tracker.request_id = request_id
+    logger.info(
+        "traework custom ingress id=%s path=%s model=%s stream=%s messages=%d tools=%s session=%s",
+        request_id,
+        req.url.path,
+        descriptor.model,
+        descriptor.stream,
+        len(messages),
+        _tool_protocol_requested(options, messages),
+        descriptor.session_id[:32],
+    )
+
+    if descriptor.stream:
+        async def openai_source():
+            async for chunk in _deferred_dispatch_stream(
+                messages, descriptor.model, options
+            ):
+                yield chunk
+
+        translated = traework_compat.translate_openai_stream_to_traework(
+            openai_source(), model=descriptor.model, request_id=request_id
+        )
+        session_id = str(options.get("session_id") or descriptor.session_id)
+        return StreamingResponse(
+            _tracked_stream(_lease_stream(translated, session_id), tracker),
+            media_type="text/event-stream",
+            headers=_sse_headers(),
+        )
+
+    response = await _tracked_dispatch(messages, descriptor.model, options, tracker)
+    if getattr(response, "status_code", 200) >= 400:
+        payload = _response_json_payload(response)
+        return JSONResponse(
+            traework_compat.openai_error_to_traework(
+                payload,
+                model=descriptor.model,
+                request_id=request_id,
+            ),
+            status_code=getattr(response, "status_code", 502),
+        )
+    payload = _response_json_payload(response)
+    return JSONResponse(
+        traework_compat.openai_completion_to_traework(
+            payload, model=descriptor.model
+        )
+    )
+
+
+async def handle_chat(req: Request):
+    request_id = "req-" + uuid_mod.uuid4().hex
+    try:
+        body, _body_bytes = await _read_json_body(
+            req,
+            endpoint="chat",
+            trace_id=request_id,
+        )
+    except _RequestBodyError as exc:
+        logger.warning(
+            "request body rejected id=%s endpoint=chat bytes=%d error=%s",
+            request_id,
+            exc.raw_bytes,
+            exc,
+        )
+        return _openai_error(400, str(exc), "invalid_request_error")
+
+    # A TraeWork custom model may use the ordinary /v1/chat/completions URL,
+    # but native raw paths and the client's identifying headers are distinct
+    # enough to route it without changing OpenAI callers.
+    if traework_compat.is_traework_request(
+        req.url.path, dict(req.headers), body
+    ):
+        return await _handle_traework_custom(
+            req, body=body, request_id=request_id
+        )
+
+    messages = _normalize_chat_messages(body.get("messages"))
+    if not isinstance(messages, list) or not messages:
+        # Accept the lightweight aliases emitted by a few terminal adapters.
+        # This keeps a valid user prompt from being mistaken for an empty
+        # request when the adapter does not use the Chat Completions field name.
+        for alias in ("prompt", "query", "input_text", "content"):
+            candidate = body.get(alias)
+            if candidate not in (None, "", [], {}):
+                messages = [{"role": "user", "content": candidate}]
+                break
+        if messages:
+            options_from_response = {}
+        else:
+            # Some OpenAI-compatible clients accidentally send a Responses-shaped
+            # payload to /chat/completions. Normalize it instead of dropping the
+            # user prompt before the request can reach Trae.
+            if "input" in body:
+                try:
+                    messages, response_options, _response_context = responses_api.normalize_request(body)
+                    options_from_response = dict(response_options)
+                except responses_api.ResponsesRequestError as exc:
+                    return _openai_error(400, str(exc), "invalid_request_error", exc.param)
+            else:
+                return _openai_error(400, "messages is required", "invalid_request_error")
+    else:
+        options_from_response = {}
+
+    messages = cli_client.sanitize_assistant_history_messages(messages)
+
+    model = body.get("model") or "auto"
+    stream = bool(body.get("stream", False))
+    options = {
+        key: body[key]
+        for key in CHAT_OPTION_FIELDS
+        if key in body
+    }
+    options.update(options_from_response)
+    options = _apply_tool_header_hints(req, options)
+    requested_session_id = _request_session_hint(req, body)
+    if requested_session_id and not options.get("session_id") and not options.get("sessionId"):
+        options["session_id"] = requested_session_id
+
+    option_error = _validate_chat_options(options)
+    if option_error is not None:
+        return option_error
+    for key in ("max_tokens", "maxTokens", "max_completion_tokens"):
+        if key in options:
+            options[key] = clamp_max_completion_tokens(options[key], model)
+    options = _with_auto_client_context(req, body, messages, options)
+    options = _bind_chat_session(
+        messages,
+        options,
+        requested_session_id=requested_session_id,
+    )
+    tracker = _UsageTracker(model, req.url.path, stream, options, messages)
+    tracker.request_id = request_id
+    options["_relay_request_id"] = request_id
+    logger.info(
+        "request received id=%s path=%s keys=%s messages=%d input_chars=%d stream=%s",
+        tracker.request_id,
+        req.url.path,
+        ",".join(sorted(str(key) for key in body.keys())),
+        len(messages),
+        sum(len(str(item.get("content") or "")) for item in messages if isinstance(item, Mapping)),
+        stream,
+    )
+    logger.info(
+        "request binding id=%s account=%s billing=%s session=%s",
+        tracker.request_id,
+        str(options.get("_account_id") or "default"),
+        str(options.get("_billing_id") or options.get("_account_id") or "default"),
+        str(options.get("session_id") or options.get("sessionId") or "")[:32],
+    )
+    if stream:
+        session_id = str(options.get("session_id") or options.get("sessionId") or "")
+        return StreamingResponse(
+            _tracked_stream(
+                _lease_stream(
+                    _deferred_dispatch_stream(messages, model, options), session_id
+                ),
+                tracker,
+            ),
+            media_type="text/event-stream",
+            headers=_sse_headers(),
+        )
+    return await _tracked_dispatch(messages, model, options, tracker)
+
+
+async def handle_responses(req: Request):
+    request_id = "req-" + uuid_mod.uuid4().hex
+    try:
+        body, _body_bytes = await _read_json_body(
+            req,
+            endpoint="responses",
+            trace_id=request_id,
+        )
+    except _RequestBodyError as exc:
+        logger.warning(
+            "request body rejected id=%s endpoint=responses bytes=%d error=%s",
+            request_id,
+            exc.raw_bytes,
+            exc,
+        )
+        return _openai_error(400, str(exc), "invalid_request_error")
+
+    try:
+        messages, options, context = responses_api.normalize_request(body)
+    except responses_api.ResponsesRequestError as exc:
+        return _openai_error(
+            400, str(exc), "invalid_request_error", exc.param
+        )
+
+    messages = cli_client.sanitize_assistant_history_messages(messages)
+
+    options = _apply_tool_header_hints(req, options)
+    option_error = _validate_chat_options(options)
+    if option_error is not None:
+        return option_error
+    if "max_tokens" in options:
+        options["max_tokens"] = clamp_max_completion_tokens(
+            options["max_tokens"], context.model
+        )
+    options = _with_auto_client_context(req, body, messages, options)
+    # Responses response ids change on every turn.  The context retains the
+    # first raw session id so multi-tool continuations stay in one upstream
+    # Trae conversation even when the caller sends only function_call_output.
+    if not options.get("session_id") and not options.get("sessionId"):
+        options["session_id"] = context.upstream_session_id or context.response_id
+    options = _bind_chat_session(
+        messages,
+        options,
+        requested_session_id=str(options.get("session_id") or options.get("sessionId") or ""),
+    )
+    stream = bool(body.get("stream", False))
+    tracker = _UsageTracker(context.model, req.url.path, stream, options, messages)
+    tracker.request_id = request_id
+    options["_relay_request_id"] = request_id
+    logger.info(
+        "request received id=%s path=%s keys=%s messages=%d input_chars=%d stream=%s",
+        tracker.request_id,
+        req.url.path,
+        ",".join(sorted(str(key) for key in body.keys())),
+        len(messages),
+        sum(len(str(item.get("content") or "")) for item in messages if isinstance(item, Mapping)),
+        stream,
+    )
+    logger.info(
+        "request binding id=%s account=%s billing=%s session=%s",
+        tracker.request_id,
+        str(options.get("_account_id") or "default"),
+        str(options.get("_billing_id") or options.get("_account_id") or "default"),
+        str(options.get("session_id") or options.get("sessionId") or "")[:32],
+    )
+    if stream:
+        session_id = str(options.get("session_id") or options.get("sessionId") or "")
+        return StreamingResponse(
+            _tracked_stream(
+                _lease_stream(
+                    responses_api.translate_chat_stream(
+                        _deferred_dispatch_stream(messages, context.model, options),
+                        context,
+                    ),
+                    session_id,
+                ),
+                tracker,
+            ),
+            media_type="text/event-stream",
+            headers=_sse_headers(),
+        )
+    chat_response = await _tracked_dispatch(
+        messages, context.model, options, tracker
+    )
+    if getattr(chat_response, "status_code", 200) >= 400:
+        return chat_response
+    try:
+        completion = json.loads(chat_response.body)
+    except Exception:
+        return _openai_error(
+            502, "Invalid Chat Completions response", "api_error"
+        )
+    return JSONResponse(
+        content=responses_api.completion_to_response(completion, context)
+    )
+
+
+async def init_app():
+    _load_usage_history()
+    _load_usage_stats()
+    auth.init_auth()
+    _restore_persisted_relay_settings()
+    auth.apply_max_mode_settings()
+    _schedule_pending_usage_enrichment()
+    logger.info(
+        "Trae CN relay initialized (auth source=%s edition=%s cli=%s)",
+        auth.get_auth().source,
+        auth.get_auth().edition,
+        cli_client.resolve_cli_command() or "not-found",
+    )
+
+
+async def _web_reaper_loop():
+    interval = float(os.environ.get("TRAE_WEB_REAP_INTERVAL", "10"))
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await trae_client.reap_idle_web_sessions()
+        except Exception as e:
+            logger.warning("web reaper error: %s", e)
+
+
+async def _terminal_session_reaper_loop():
+    try:
+        interval = float(os.environ.get("TRAE_SESSION_REAP_INTERVAL_SECONDS", "5"))
+    except (TypeError, ValueError):
+        interval = 5.0
+    interval = max(1.0, min(interval, 60.0))
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            reaped = await _reap_idle_chat_sessions()
+            if reaped:
+                logger.info("reaped %d idle terminal session lease(s)", reaped)
+        except Exception as e:
+            logger.warning("terminal session reaper error: %s", e)
+
+
+async def _checkin_auto_retry_cycle() -> None:
+    """Retry accounts whose persisted 9074 backoff has expired."""
+    try:
+        for account_id, record in auth.get_accounts_raw():
+            checkin = record.get("checkin") or {}
+            if checkin.get("checked_in") is True and _checkin_cache_is_today(record):
+                if float(checkin.get("retry_backoff") or 0) > 0:
+                    _checkin_clear_retry_state(account_id)
+                continue
+            if not (record.get("token") or ""):
+                continue
+            # Only accounts that actually hit 9074 belong here; this loop must
+            # not turn into a general claim poller. ``device_generation``
+            # survives a retry-state reset, so an account stays visible after
+            # its backoff is cleared but before it has claimed.
+            pending_9074 = (
+                float(checkin.get("retry_backoff") or 0) > 0
+                or int(checkin.get("retry_9074_count") or 0) > 0
+                or int(checkin.get("device_generation") or 0) > 0
+            )
+            if not pending_9074:
+                continue
+            cooldown = _checkin_cooldown_remaining(account_id)
+            if cooldown:
+                continue
+            try:
+                result = await _claim_checkin_account(account_id)
+            except Exception as exc:
+                logger.warning(
+                    "checkin auto retry account=%s error: %s",
+                    account_id,
+                    exc,
+                )
+                continue
+            if result.get("success"):
+                logger.info(
+                    "checkin auto retry ok account=%s skipped=%s",
+                    account_id,
+                    result.get("skipped"),
+                )
+            else:
+                logger.info(
+                    "checkin auto retry pending account=%s retry_after=%s",
+                    account_id,
+                    result.get("retry_after_seconds"),
+                )
+    except Exception as exc:
+        logger.warning("checkin auto retry cycle error: %s", exc)
+
+
+async def _checkin_auto_retry_loop():
+    """Periodically retry accounts stuck in an upstream 9074 window."""
+    interval = max(15.0, float(CHECKIN_AUTO_RETRY_INTERVAL))
+    while True:
+        await asyncio.sleep(interval)
+        await _checkin_auto_retry_cycle()
+
+
+# Scheduled daily check-in.  The loop wakes every few seconds, re-reads the
+# console settings and fires once per business day (UTC+8) after the chosen
+# time.  A relay that starts late still claims that same day.
+AUTO_CHECKIN_POLL_SECONDS = 30.0
+_AUTO_CHECKIN_STATE: dict = {
+    "running": False,
+    "last_run_at": 0.0,
+    "last_run_date": "",
+    "last_trigger": "",
+    "summary": None,
+}
+_AUTO_CHECKIN_LOCK = asyncio.Lock()
+
+
+def _auto_checkin_target(now: Optional[datetime] = None, time_text: str = "08:30") -> datetime:
+    """Return today's scheduled run time in the check-in timezone."""
+    current = now or datetime.now(_CHECKIN_TIMEZONE)
+    hour, minute = (int(part) for part in time_text.split(":", 1))
+    return current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+
+def _auto_checkin_next_run(settings: dict, now: Optional[datetime] = None) -> Optional[datetime]:
+    if not settings.get("enabled"):
+        return None
+    current = now or datetime.now(_CHECKIN_TIMEZONE)
+    target = _auto_checkin_target(current, settings.get("time") or "08:30")
+    if _AUTO_CHECKIN_STATE.get("last_run_date") == current.date().isoformat():
+        return target + timedelta(days=1)
+    # Past today's time but not run yet: the loop fires on its next tick.
+    return max(target, current)
+
+
+def _auto_checkin_due(settings: dict, now: Optional[datetime] = None) -> bool:
+    if not settings.get("enabled"):
+        return False
+    current = now or datetime.now(_CHECKIN_TIMEZONE)
+    if _AUTO_CHECKIN_STATE.get("last_run_date") == current.date().isoformat():
+        return False
+    return current >= _auto_checkin_target(current, settings.get("time") or "08:30")
+
+
+async def _auto_checkin_cycle(trigger: str = "schedule") -> dict:
+    """Claim check-in for every account with a token, strictly in order."""
+    summary = {"total": 0, "ok": 0, "skipped": 0, "failed": 0, "no_token": 0}
+    if _AUTO_CHECKIN_LOCK.locked():
+        return {**summary, "busy": True}
+    async with _AUTO_CHECKIN_LOCK:
+        _AUTO_CHECKIN_STATE["running"] = True
+        now = datetime.now(_CHECKIN_TIMEZONE)
+        try:
+            for account_id, record in list(auth.get_accounts_raw()):
+                summary["total"] += 1
+                if not (record.get("token") or ""):
+                    summary["no_token"] += 1
+                    continue
+                checkin = record.get("checkin") or {}
+                if checkin.get("checked_in") is True and _checkin_cache_is_today(record):
+                    summary["skipped"] += 1
+                    continue
+                try:
+                    result = await _claim_checkin_account(account_id)
+                except Exception as exc:
+                    logger.warning("auto checkin account=%s error: %s", account_id, exc)
+                    summary["failed"] += 1
+                    continue
+                if result.get("success"):
+                    summary["skipped" if result.get("skipped") else "ok"] += 1
+                else:
+                    summary["failed"] += 1
+        finally:
+            _AUTO_CHECKIN_STATE.update(
+                running=False,
+                last_run_at=time.time(),
+                last_trigger=trigger,
+                summary=dict(summary),
+            )
+            # Only the scheduler consumes the daily slot; a manual run leaves
+            # the scheduled pass in place (already claimed accounts are skipped).
+            if trigger == "schedule":
+                _AUTO_CHECKIN_STATE["last_run_date"] = now.date().isoformat()
+        logger.info(
+            "auto checkin done trigger=%s total=%d ok=%d skipped=%d failed=%d no_token=%d",
+            trigger,
+            summary["total"],
+            summary["ok"],
+            summary["skipped"],
+            summary["failed"],
+            summary["no_token"],
+        )
+        return summary
+
+
+async def _auto_checkin_loop():
+    while True:
+        await asyncio.sleep(AUTO_CHECKIN_POLL_SECONDS)
+        try:
+            if _auto_checkin_due(auth.get_auto_checkin_settings()):
+                await _auto_checkin_cycle("schedule")
+        except Exception as exc:
+            logger.warning("auto checkin loop error: %s", exc)
+
+
+def _auto_checkin_payload() -> dict:
+    settings = auth.get_auto_checkin_settings()
+    next_run = _auto_checkin_next_run(settings)
+    last_at = float(_AUTO_CHECKIN_STATE.get("last_run_at") or 0)
+    return {
+        "success": True,
+        **settings,
+        "timezone": "Asia/Shanghai",
+        "next_run": next_run.isoformat(timespec="minutes") if next_run else None,
+        "running": bool(_AUTO_CHECKIN_STATE.get("running")),
+        "last_run_at": (
+            datetime.fromtimestamp(last_at, _CHECKIN_TIMEZONE).isoformat(timespec="seconds")
+            if last_at > 0
+            else None
+        ),
+        "last_trigger": _AUTO_CHECKIN_STATE.get("last_trigger") or None,
+        "summary": _AUTO_CHECKIN_STATE.get("summary"),
+    }
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_app()
+    web_reaper = asyncio.create_task(_web_reaper_loop())
+    terminal_reaper = asyncio.create_task(_terminal_session_reaper_loop())
+    checkin_retry = asyncio.create_task(_checkin_auto_retry_loop())
+    auto_checkin = asyncio.create_task(_auto_checkin_loop())
+    try:
+        yield
+    finally:
+        for reaper in (web_reaper, terminal_reaper, checkin_retry, auto_checkin):
+            reaper.cancel()
+        await asyncio.gather(web_reaper, terminal_reaper, return_exceptions=True)
+        await asyncio.gather(checkin_retry, auto_checkin, return_exceptions=True)
+        await _cancel_usage_tasks()
+
+
+app = FastAPI(title="Trae CN Relay", version=APP_VERSION, lifespan=lifespan)
+
+
+@app.exception_handler(_ModelAccountUnavailable)
+async def model_account_unavailable_handler(_request: Request, exc: _ModelAccountUnavailable):
+    return _openai_error(503, str(exc), "model_account_unavailable")
+
+
+@app.get("/api/overview")
+async def api_overview(days: int = Query(30, ge=1, le=366)):
+    """Dashboard home: token totals by day plus account and service state."""
+    accounts = auth.list_accounts()
+    remaining = 0.0
+    credits_known = False
+    unlimited = False
+    for account in accounts:
+        credits = account.get("account_credits") or {}
+        if credits.get("unlimited"):
+            unlimited = True
+        elif credits.get("remaining") is not None:
+            try:
+                remaining += float(credits["remaining"])
+                credits_known = True
+            except (TypeError, ValueError):
+                pass
+    polling = auth.get_polling_status()
+    with _USAGE_LOCK:
+        in_flight = sum(_USAGE_ACTIVE_ACCOUNTS.values())
+        recent = [_public_usage_record(record) for record in _USAGE_HISTORY[:5]]
+    return JSONResponse(
+        {
+            "success": True,
+            "generated_at": time.time(),
+            "timezone": "Asia/Shanghai",
+            "usage": _usage_overview(days),
+            "accounts": {
+                "total": len(accounts),
+                "valid": sum(1 for account in accounts if account.get("is_valid")),
+                "checked_in": sum(1 for account in accounts if account.get("checked_in") is True),
+                "credits_remaining": (
+                    "unlimited" if unlimited else round(remaining, 2) if credits_known else None
+                ),
+                "active": auth.get_active_account_id() or None,
+            },
+            "service": {
+                "version": APP_VERSION,
+                "uptime_seconds": round(time.time() - _PROCESS_STARTED_AT),
+                "upstream_mode": _current_upstream_mode(),
+                "auto_route": _auto_route_enabled(),
+                "polling": bool(polling.get("enabled")),
+                "polling_mode": polling.get("mode"),
+                "max_mode": bool(auth.get_max_mode_settings().get("enabled")),
+                "auto_checkin": auth.get_auto_checkin_settings(),
+                "in_flight": in_flight,
+                "token_ok": auth.get_auth().is_valid(),
+            },
+            "recent": recent,
+        },
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/api/usage/records")
+async def get_usage_records():
+    """Return the usage history list (newest first)."""
+    with _USAGE_LOCK:
+        records = [_public_usage_record(record) for record in _USAGE_HISTORY]
+    return JSONResponse(records, headers={"Cache-Control": "no-store"})
+
+@app.get("/api/usage/last")
+async def api_usage_last():
+    """Backward-compatible: return only the latest record."""
+    with _USAGE_LOCK:
+        records = [_public_usage_record(record) for record in _USAGE_HISTORY[:1]]
+    return JSONResponse(records, headers={"Cache-Control": "no-store"})
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    if not API_KEYS:
+        return await call_next(request)
+    if request.url.path == "/api/model-test":
+        # Keep the dashboard probe usable on loopback/RFC1918 management
+        # networks without exposing a billable model endpoint to the public.
+        client_host = str(getattr(request.client, "host", "") or "").strip()
+        try:
+            client_ip = ipaddress.ip_address(client_host)
+        except ValueError:
+            client_ip = None
+        if client_ip is not None and (
+            client_ip.is_loopback
+            or client_ip.is_private
+            or client_ip.is_link_local
+        ):
+            return await call_next(request)
+    if request.url.path in PUBLIC_PATHS or request.url.path.startswith(PUBLIC_PATH_PREFIXES):
+        return await call_next(request)
+    header = request.headers.get("authorization", "")
+    if header.lower().startswith("bearer "):
+        token = header[7:].strip()
+    else:
+        token = header.strip()
+    if token not in API_KEYS:
+        return _openai_error(401, "Invalid API key", "authentication_error")
+    return await call_next(request)
+
+
+@app.get("/")
+async def root():
+    return {"service": "trae-cn-relay", "status": "ok"}
+
+
+@app.get("/favicon.svg", include_in_schema=False)
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return Response(
+        LOGO_SVG,
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+@app.get("/healthz")
+async def healthz():
+    return {"status": "ok"}
+
+
+@app.get("/v1/status")
+async def status():
+    state = auth.get_auth()
+    return {
+        "status": "ok",
+        "edition": state.edition,
+        "source": state.source,
+        "base_url": state.host,
+        "web_base": auth.get_settings().get("web_base_url") or WEB_BASE,
+        "upstream_mode": _current_upstream_mode(),
+        "auto_route": _auto_route_enabled(),
+        "build_revision": os.environ.get("RELAY_BUILD_REVISION", "local"),
+        "traework_native": {
+            "enabled": traework_native_bridge.NativeBridgeConfig.from_env().enabled,
+            "platform_supported": traework_native_bridge.NativeBridgeConfig.from_env().enabled_for_platform,
+            "install_dir_configured": bool(
+                traework_native_bridge.NativeBridgeConfig.from_env().install_dir
+            ),
+            "helper_url": traework_native_bridge.NativeBridgeConfig.from_env().bridge_url,
+        },
+        "tool_execution": "client",
+        "capabilities": {
+            "openai_tool_calls": True,
+            "openai_responses": True,
+            "responses_custom_tools": True,
+            "responses_namespaces": True,
+            "client_context": True,
+            "tool_result_continuation": True,
+            "traework_custom_model": True,
+            "traework_raw_ingress": True,
+            "traework_connectivity_check": True,
+            "parallel_tool_calls": True,
+            "server_executes_caller_tools": False,
+            "tool_upstreams": (
+                ["raw"]
+                if _current_upstream_mode() in ("raw", "direct", "auto")
+                else ["cli"]
+                if _current_upstream_mode() == "cli"
+                else ["traework-native"]
+                if _current_upstream_mode() in ("traework-native", "native", "traework")
+                else []
+            ),
+            "terminal_session_leases": True,
+        },
+        "has_token": bool(state.token),
+        "token_ok": state.is_valid(),
+        "session_idle_timeout_seconds": _CHAT_SESSION_TTL,
+        "port": PORT,
+        "cli": cli_client.get_cli_status(),
+    }
+
+
+@app.get("/v1/models")
+async def models(request: Request):
+    force = request.query_params.get("refresh", "").lower() in ("1", "true", "yes")
+    try:
+        items = await trae_client.get_models(force=force)
+    except Exception as e:
+        return _openai_error(502, str(e), "api_error")
+    return {"object": "list", "data": items}
+
+
+@app.get("/models")
+async def models_compat(request: Request):
+    """Unversioned discovery alias used by some TraeWork model forms."""
+
+    return await models(request)
+
+
+@app.post("/v1")
+async def chat_v1(req: Request):
+    return await handle_chat(req)
+
+
+@app.post("/v1/chat")
+async def chat_v1_chat(req: Request):
+    return await handle_chat(req)
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(req: Request):
+    return await handle_chat(req)
+
+
+@app.post("/chat/completions")
+async def chat_completions_compat(req: Request):
+    """OpenAI-compatible alias for custom-model base URLs without ``/v1``."""
+
+    return await handle_chat(req)
+
+
+@app.post("/api/ide/v2/llm_raw_chat")
+@app.post("/api/agent/v3/llm_raw_chat_custom_model")
+@app.post("/api/agent/v3/custom_model_proxy/chat")
+@app.post("/v1/traework/chat")
+async def traework_custom_chat(req: Request):
+    return await _handle_traework_custom(req)
+
+
+@app.post("/api/agent/v3/custom_model_connectivity_check")
+@app.post("/api/ide/v1/custom_model_connectivity_check")
+@app.post("/v1/custom_model/connectivity")
+async def traework_custom_connectivity(req: Request):
+    request_id = "req-" + uuid_mod.uuid4().hex
+    try:
+        body, _ = await _read_json_body(
+            req, endpoint="traework-connectivity", trace_id=request_id
+        )
+    except _RequestBodyError:
+        # Several TraeWork builds send an empty connectivity POST and expect
+        # the backend to report its default model. Keep that probe useful.
+        body = {}
+    try:
+        upstream_models = await trae_client.get_models(force=False)
+    except Exception as exc:
+        logger.warning("traework connectivity model list failed: %s", exc)
+        upstream_models = []
+    return JSONResponse(
+        traework_compat.connectivity_response(body, models=upstream_models)
+    )
+
+
+@app.post("/v1/responses")
+async def responses(req: Request):
+    return await handle_responses(req)
+
+
+@app.post("/api/model-test")
+async def api_model_test(req: Request):
+    """Probe one model end to end through the real dispatch path.
+
+    Runs the same routing a client request would, so the result reflects actual
+    connectivity rather than a config lookup. ``mode`` selects a plain text
+    probe or a tool-call probe.
+    """
+
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    model = str(body.get("model") or "").strip()
+    if not model:
+        return JSONResponse(
+            {"success": False, "error": "model is required"}, status_code=400
+        )
+    mode = str(body.get("mode") or "text").strip().lower()
+    if mode not in {"text", "tool"}:
+        return JSONResponse(
+            {"success": False, "error": "mode must be text or tool"}, status_code=400
+        )
+    try:
+        timeout = float(body.get("timeout") or 120)
+    except (TypeError, ValueError):
+        timeout = 120.0
+    timeout = max(10.0, min(timeout, 600.0))
+    endpoint = str(body.get("endpoint") or _current_upstream_mode()).strip().lower()
+    if endpoint not in set(_VALID_UPSTREAM_MODES) | {AUTO_ROUTE_MODE}:
+        return JSONResponse(
+            {"success": False, "error": f"unsupported endpoint: {endpoint}"},
+            status_code=400,
+        )
+
+    probe_tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "relay_probe",
+                "description": "Echo a probe token back to the relay",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"token": {"type": "string"}},
+                    "required": ["token"],
+                },
+            },
+        }
+    ]
+    if mode == "tool":
+        messages = [
+            {
+                "role": "user",
+                "content": (
+                    "Call relay_probe with token=\"pong\". Tool call only, "
+                    "no explanation."
+                ),
+            }
+        ]
+        options: dict[str, Any] = {
+            "tools": probe_tools,
+            "tool_choice": "auto",
+            "parallel_tool_calls": False,
+        }
+    else:
+        messages = [{"role": "user", "content": "Reply with exactly: pong"}]
+        options = {}
+    options["max_tokens"] = 64
+    effort = str(body.get("reasoning_effort") or "").strip().lower()
+    if effort:
+        if effort not in {"minimal", "low", "medium", "high", "xhigh", "max"}:
+            return JSONResponse(
+                {"success": False, "error": f"unsupported reasoning_effort: {effort}"},
+                status_code=400,
+            )
+        options["reasoning_effort"] = effort
+        # Effort only matters when the model actually thinks; give it room.
+        options["max_tokens"] = 4096
+    if bool(body.get("thinking")):
+        options["thinking"] = {"type": "enabled"}
+    max_mode_requested = bool(body.get("max_mode"))
+    if max_mode_requested:
+        options["trae_max_mode"] = True
+    trace: dict[str, Any] = {}
+    options["_upstream_mode"] = endpoint
+    # Connectivity checks should exercise the same resilient route as a real
+    # API request.  Operators can still pass ``disable_fallback=true`` when
+    # diagnosing one native endpoint in isolation.
+    options["_disable_upstream_fallback"] = bool(body.get("disable_fallback", False))
+    options["_upstream_trace"] = trace
+
+    started = time.monotonic()
+    try:
+        result = await asyncio.wait_for(
+            _dispatch_chat(messages, model, False, options),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        return JSONResponse(
+            {
+                "success": False,
+                "model": model,
+                "mode": mode,
+                "requested_endpoint": endpoint,
+                **trace,
+                "elapsed_ms": int((time.monotonic() - started) * 1000),
+                "error": f"timed out after {int(timeout)}s",
+            }
+        )
+    except Exception as exc:
+        return JSONResponse(
+            {
+                "success": False,
+                "model": model,
+                "mode": mode,
+                "requested_endpoint": endpoint,
+                **trace,
+                "elapsed_ms": int((time.monotonic() - started) * 1000),
+                "error": str(exc)[:400],
+            }
+        )
+
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    payload: dict[str, Any] = {}
+    http_status = 200
+    if isinstance(result, JSONResponse):
+        http_status = result.status_code
+        try:
+            payload = json.loads(bytes(result.body).decode("utf-8"))
+        except Exception:
+            payload = {}
+    elif isinstance(result, Mapping):
+        payload = dict(result)
+    if not isinstance(payload, dict):
+        payload = {}
+    upstream_error = payload.get("error")
+    if http_status >= 400 or isinstance(upstream_error, Mapping):
+        message = ""
+        if isinstance(upstream_error, Mapping):
+            message = str(upstream_error.get("message") or "")
+        return JSONResponse(
+            {
+                "success": False,
+                "model": model,
+                "mode": mode,
+                "requested_endpoint": endpoint,
+                **trace,
+                "elapsed_ms": elapsed_ms,
+                "error": (message or f"upstream returned HTTP {http_status}")[:400],
+            }
+        )
+    result = payload
+    choice = ((result or {}).get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    content = str(message.get("content") or "")
+    tool_calls = message.get("tool_calls") or []
+    usage = (result or {}).get("usage") or {}
+    empty_marker = "trae upstream returned an empty response" in content
+    if mode == "tool":
+        ok = bool(tool_calls)
+    else:
+        ok = bool(content.strip()) and not empty_marker
+    return JSONResponse(
+        {
+            "success": ok,
+            "model": model,
+            "mode": mode,
+            "requested_endpoint": endpoint,
+            **trace,
+            "elapsed_ms": elapsed_ms,
+            "finish_reason": choice.get("finish_reason"),
+            "provider_model_name": (result or {}).get("provider_model_name") or "",
+            "requested_reasoning_effort": effort or None,
+            "reasoning_effort_applied": trace.get("reasoning_effort_applied") or None,
+            "reasoning_effort_note": _effort_note(effort, trace),
+            "requested_max_mode": max_mode_requested,
+            "reasoning": str(message.get("reasoning_content") or "")[:600] or None,
+            "reply": content[:200],
+            "tool_calls": [
+                {
+                    "name": (call.get("function") or {}).get("name"),
+                    "arguments": ((call.get("function") or {}).get("arguments") or "")[
+                        :120
+                    ],
+                }
+                for call in tool_calls
+                if isinstance(call, dict)
+            ],
+            "usage": {
+                "prompt_tokens": usage.get("prompt_tokens"),
+                "completion_tokens": usage.get("completion_tokens"),
+                "total_tokens": usage.get("total_tokens"),
+                "reasoning_tokens": (
+                    usage["completion_tokens_details"].get("reasoning_tokens")
+                    if isinstance(usage.get("completion_tokens_details"), Mapping)
+                    else usage.get("reasoning_tokens")
+                ),
+            },
+            "error": None if ok else (
+                "upstream returned an empty response"
+                if empty_marker or not content.strip()
+                else "no tool call was returned"
+            ),
+        }
+    )
+
+
+@app.get("/v1")
+async def v1_index(request: Request):
+    return await models(request)
+
+
+# ---- Web login endpoints ----
+
+@app.get("/web/login", response_class=HTMLResponse)
+async def web_login():
+    return _web_login_html()
+
+
+START_AUTH_BAT = Path(__file__).resolve().parent.parent / "start_auth.bat"
+
+@app.get("/web/login/download", response_class=FileResponse)
+async def web_login_download(as_param: str = Query("", alias="as")):
+    if as_param == "bat":
+        if not START_AUTH_BAT.exists():
+            return JSONResponse({"success": False, "error": "start_auth.bat not found"}, status_code=404)
+        return FileResponse(
+            START_AUTH_BAT,
+            media_type="application/octet-stream",
+            filename="start_auth.bat",
+        )
+    if not WEB_LOGIN_SCRIPT.exists():
+        return JSONResponse({"success": False, "error": "web_login.py not found"}, status_code=404)
+    return FileResponse(
+        WEB_LOGIN_SCRIPT,
+        media_type="text/plain; charset=utf-8",
+        filename="web_login.py",
+    )
+
+
+@app.get("/authorize", response_class=HTMLResponse)
+async def oauth_callback(request: Request):
+    parsed = await _parse_oauth_params(dict(request.query_params))
+    trace_id = request.query_params.get("loginTraceID") or request.query_params.get("login_trace_id") or ""
+    if not parsed.get("token"):
+        return HTMLResponse(
+            _oauth_result_html(False, "未收到有效的 userJwt，请确认已登录 trae.cn", trace_id),
+            status_code=400,
+        )
+    try:
+        auth.add_account(parsed)
+    except ValueError as e:
+        return HTMLResponse(_oauth_result_html(False, str(e), trace_id), status_code=400)
+    return HTMLResponse(_oauth_result_html(True, "登录成功，凭证已写入服务器", trace_id))
+
+
+@app.post("/api/web-auth")
+async def web_auth(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"success": False, "error": "Invalid JSON body"}, status_code=400)
+
+    token = body.get("token") or body.get("accessToken") or ""
+    if not token:
+        return JSONResponse({"success": False, "error": "token is required"}, status_code=400)
+
+    parsed = {
+        "token": token,
+        "refresh_token": body.get("refreshToken") or body.get("refresh_token") or "",
+        "user_id": body.get("userId") or body.get("user_id") or "",
+        "tenant_id": body.get("tenantId") or body.get("tenant_id") or "",
+        "region": body.get("region") or "",
+        "ai_region": body.get("aiRegion") or body.get("ai_region") or "",
+        "host": body.get("host") or "",
+        "expired_at": body.get("expiredAt") or body.get("expired_at") or body.get("tokenExpires") or "",
+        "refresh_expired_at": body.get("refreshExpiredAt") or body.get("refresh_expired_at") or body.get("refreshExpires") or "",
+        "client_id": body.get("clientId") or body.get("client_id") or body.get("clientID") or "",
+        "web_id": body.get("webId") or body.get("web_id") or "",
+        "biz_user_id": body.get("bizUserId") or body.get("biz_user_id") or "",
+        "user_unique_id": body.get("userUniqueId") or body.get("user_unique_id") or "",
+        "scope": body.get("scope") or "",
+        "tenant": body.get("tenant") or "",
+        "app_language": body.get("appLanguage") or body.get("app_language") or "",
+        "user_region": body.get("userRegion") or body.get("user_region") or "",
+        "user_identity": body.get("userIdentity") or body.get("user_identity") or "",
+        "screen_name": body.get("screenName") or body.get("screen_name") or "",
+    }
+    label = body.get("label") or ""
+    try:
+        auth.add_account(parsed, label=label)
+    except ValueError as e:
+        return JSONResponse({"success": False, "error": str(e)}, status_code=400)
+
+    s = auth.get_auth()
+    return JSONResponse({
+        "success": True,
+        "has_token": bool(s.token),
+        "user_id": s.user_id or "",
+    })
+
+
+@app.get("/api/checkin/status")
+async def api_checkin_status():
+    try:
+        data = await trae_client.fetch_checkin_credits_status()
+    except Exception as e:
+        return JSONResponse({"success": False, "error": str(e)}, status_code=502)
+    return JSONResponse({"success": True, "data": data})
+
+@app.get("/api/checkin/accounts")
+async def api_checkin_accounts():
+    """Refresh daily checkin state only for every stored account.
+
+    Entitlement credits use a different upstream API and are intentionally
+    refreshed through ``/api/checkin/credits/accounts``. Keeping these probes
+    apart stops an ordinary dashboard refresh from creating extra checkin
+    traffic while a user is recovering from code 9074.
+    """
+    raw_accounts = auth.get_accounts_raw()
+
+    async def _query_one(aid: str, rec: dict) -> dict:
+        row = _cached_checkin_account_snapshot(aid, rec)
+        if not (rec.get("token") or ""):
+            row["error"] = "No token"
+            return row
+        try:
+            async with _checkin_account_lock(aid):
+                row.update(
+                    await _fetch_checkin_status_snapshot(
+                        aid, rec, use_cached_on_cooldown=True
+                    )
+                )
+        except Exception as e:
+            row["error"] = str(e)
+        # Username check rides on the status refresh, not on credits queries.
+        try:
+            row.update(await _sync_account_user_name(aid))
+        except Exception as e:
+            row["user_name_error"] = str(e)[:200]
+        return row
+
+    results = await asyncio.gather(
+        *[_query_one(aid, rec) for aid, rec in raw_accounts],
+        return_exceptions=True,
+    )
+    for idx, item in enumerate(results):
+        if isinstance(item, BaseException):
+            aid, rec = raw_accounts[idx]
+            results[idx] = {
+                **_cached_checkin_account_snapshot(aid, rec),
+                "error": str(item),
+            }
+    return JSONResponse(
+        {"success": True, "active": auth.get_active_account_id(), "accounts": results}
+    )
+
+
+@app.get("/api/checkin/credits/accounts")
+async def api_checkin_credits_accounts():
+    """Refresh entitlement credits only for every stored account.
+
+    This endpoint never calls the daily-checkin status API. It is deliberately
+    separate from ``/api/checkin/accounts`` so credits refreshes cannot create
+    extra checkin probes or interfere with claim cooldown handling.
+    """
+    raw_accounts = auth.get_accounts_raw()
+
+    async def _query_one(aid: str, rec: dict) -> dict:
+        row = _cached_checkin_account_snapshot(aid, rec)
+        if not (rec.get("token") or ""):
+            row["error"] = "No token"
+            return row
+        try:
+            async with _checkin_account_lock(aid):
+                row.update(await _fetch_credit_account_snapshot(aid, rec))
+        except Exception as e:
+            row["error"] = str(e)
+        return row
+
+    results = await asyncio.gather(
+        *[_query_one(aid, rec) for aid, rec in raw_accounts],
+        return_exceptions=True,
+    )
+    for idx, item in enumerate(results):
+        if isinstance(item, BaseException):
+            aid, rec = raw_accounts[idx]
+            results[idx] = {
+                **_cached_checkin_account_snapshot(aid, rec),
+                "error": str(item),
+            }
+    return JSONResponse({"success": True, "accounts": results})
+
+
+@app.get("/api/checkin/credits/{account_id}")
+async def api_checkin_credits(account_id: str):
+    """Fetch general account credits for one account without querying checkin.
+
+    Keep this dynamic route after ``/api/checkin/credits/accounts``. Starlette
+    resolves routes in declaration order, so placing it first makes the bulk
+    path look like an account whose id is literally ``accounts``.
+    """
+    rec = auth.get_account_record(account_id)
+    token = rec.get("token") or ""
+    if not token:
+        return JSONResponse(
+            {"success": False, "error": "account not found or token missing"},
+            status_code=404,
+        )
+    try:
+        raw = await trae_client.fetch_account_credits(token)
+        parsed = trae_client.parse_account_credits(raw)
+        auth.merge_account_credits(account_id, {"account_credits": parsed})
+        return JSONResponse(
+            {
+                "success": True,
+                "id": account_id,
+                "credits": parsed,
+                "raw": raw,
+            }
+        )
+    except Exception as e:
+        return JSONResponse({"success": False, "error": str(e)}, status_code=502)
+
+
+def _credits_user_name(raw: dict) -> str:
+    """Extract the upstream 用户名 from an entitlement-usage response.
+
+    The pay API sometimes carries the profile name (user_name / userName /
+    screenName) next to the pack list; use whichever key shows up first.
+    """
+    if not isinstance(raw, dict):
+        return ""
+    for key in ("user_name", "userName", "screenName", "screen_name", "userNickName"):
+        value = raw.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    user = raw.get("user") or raw.get("user_info")
+    if isinstance(user, dict):
+        for key in ("user_name", "userName", "screenName", "name"):
+            value = user.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+async def _fetch_full_credits(token: str) -> dict:
+    """Fetch the merged general (通用) credits for one token.
+
+    Upstream merged every pack into a single 通用积分 pool, so the relay only
+    queries req_source=1 and no longer derives work/total splits.
+    """
+    raw_ac = await trae_client.fetch_account_credits(token)
+    return {
+        "account_credits": trae_client.parse_account_credits(raw_ac),
+        "user_name": _credits_user_name(raw_ac),
+    }
+
+
+def _cached_checkin_account_snapshot(
+    account_id: str, rec: dict | None = None
+) -> dict:
+    """Build one dashboard row from the persisted cache without an upstream call."""
+    record = rec if rec is not None else auth.get_account_record(account_id)
+    cached = dict(record.get("checkin") or {})
+    return {
+        "success": True,
+        "id": account_id,
+        "user_id": record.get("user_id", account_id),
+        "label": record.get("label") or record.get("user_id") or account_id,
+        "source": record.get("source", ""),
+        "has_token": bool(record.get("token")),
+        "is_active": account_id == auth.get_active_account_id(),
+        "is_valid": bool(record.get("token")),
+        "expires": record.get("expired_at", ""),
+        "checked_in": cached.get("checked_in"),
+        "credits": cached.get("credits"),
+        "checkin_enable": cached.get("enable"),
+        "account_credits": cached.get("account_credits"),
+        "checkin_updated_at": record.get(
+            "checkin_status_updated_at", record.get("checkin_updated_at", 0)
+        ),
+        "credits_updated_at": record.get("credits_updated_at", 0),
+        "checkin": cached,
+    }
+
+
+def _checkin_cache_is_today(record: dict) -> bool:
+    """Only trust a cached checked-in flag for today's Trae CN business day."""
+    try:
+        updated_at = float(record.get("checkin_status_updated_at") or 0)
+    except (TypeError, ValueError):
+        return False
+    if updated_at <= 0:
+        return False
+    updated_date = datetime.fromtimestamp(updated_at, _CHECKIN_TIMEZONE).date()
+    current_date = datetime.fromtimestamp(time.time(), _CHECKIN_TIMEZONE).date()
+    return updated_date == current_date
+
+
+def _checkin_response_is_rate_limited(data: dict) -> bool:
+    return isinstance(data, dict) and (
+        data.get("code") == 9074 or data.get("_error_code") == 9074
+    )
+
+
+def _checkin_auth_failed(data: dict) -> bool:
+    """Detect a server-side token invalidation inside a business-code response."""
+    if not isinstance(data, dict):
+        return False
+    if data.get("code") == 1001:
+        return True
+    text = str(data.get("message") or data.get("error") or "")
+    return "not able to authenticate" in text
+
+
+def _credits_auth_failed(exc: BaseException) -> bool:
+    """Detect a server-side token invalidation inside a credits fetch error."""
+    text = str(exc)
+    return "[401]" in text or "not able to authenticate" in text
+
+
+async def _fetch_credit_account_snapshot(
+    account_id: str, rec: dict | None = None
+) -> dict:
+    """Refresh entitlement credits only, preserving cached daily-checkin state."""
+    record = rec if rec is not None else auth.get_account_record(account_id)
+    token = record.get("token") or ""
+    if not token:
+        raise KeyError("account not found or token missing")
+
+    try:
+        full = await _fetch_full_credits(token)
+    except Exception as exc:
+        if _credits_auth_failed(exc) and await auth.refresh_account(account_id):
+            fresh = auth.get_account_record(account_id)
+            full = await _fetch_full_credits(fresh.get("token") or "")
+        else:
+            raise
+    patch = {key: value for key, value in full.items() if value is not None}
+    merged = (
+        auth.merge_account_credits(account_id, patch)
+        if patch
+        else dict(record.get("checkin") or {})
+    )
+    row = _cached_checkin_account_snapshot(account_id, record)
+    row.update(
+        {
+            "account_credits": merged.get("account_credits"),
+            "checkin": merged,
+        }
+    )
+    return row
+
+
+async def _sync_account_user_name(account_id: str) -> dict:
+    """Fetch GetUserInfo once and sync the ScreenName into the account label."""
+    record = auth.get_account_record(account_id)
+    token = record.get("token") or ""
+    if not token:
+        raise KeyError("account not found or token missing")
+    try:
+        info = await trae_client.fetch_user_info(token)
+    except Exception as exc:
+        if _credits_auth_failed(exc) and await auth.refresh_account(account_id):
+            fresh = auth.get_account_record(account_id)
+            info = await trae_client.fetch_user_info(fresh.get("token") or "")
+        else:
+            raise
+    name = str(info.get("ScreenName") or "").strip()
+    label, changed = auth.sync_account_screen_name(
+        account_id, name, str(info.get("UserID") or "")
+    )
+    out = {"label_synced": changed}
+    if label:
+        out["label"] = label
+    if name:
+        out["user_name"] = name
+    return out
+
+
+async def _fetch_checkin_status_snapshot(
+    account_id: str,
+    rec: dict | None = None,
+    *,
+    respect_pending: bool = True,
+    use_cached_on_cooldown: bool = False,
+) -> dict:
+    """Refresh daily-checkin state only, never entitlement credits."""
+    record = rec if rec is not None else auth.get_account_record(account_id)
+    token = record.get("token") or ""
+    if not token:
+        raise KeyError("account not found or token missing")
+
+    cached_row = _cached_checkin_account_snapshot(account_id, record)
+    # The 9074 cooldown belongs to the *claim* endpoint only. Probing showed the
+    # status endpoint keeps answering code=0 during that window, so skipping it
+    # here only pinned the dashboard to a stale checked_in=false.
+    cooldown_remaining = (
+        _checkin_cooldown_remaining(account_id) if use_cached_on_cooldown else 0
+    )
+    if use_cached_on_cooldown:
+        status_cooldown = _checkin_status_cooldown_remaining(account_id)
+        if status_cooldown:
+            # The status endpoint itself answered 9074 recently; probing again
+            # only extends that window.
+            return {
+                **cached_row,
+                "success": False,
+                "stale": True,
+                "rate_limited": True,
+                "retryable": True,
+                "retry_after_seconds": status_cooldown,
+                "error": (
+                    "Trae checkin status skipped [9074]: local cooldown active; "
+                    f"retry after at least {status_cooldown}s"
+                ),
+            }
+
+    status = await trae_client.fetch_checkin_credits_status(token, account_id)
+    if _checkin_auth_failed(status):
+        if await auth.refresh_account(account_id):
+            fresh = auth.get_account_record(account_id)
+            status = await trae_client.fetch_checkin_credits_status(
+                fresh.get("token") or "", account_id
+            )
+    if _checkin_response_is_rate_limited(status):
+        retry_after = _checkin_start_cooldown(account_id)
+        _CHECKIN_STATUS_COOLDOWN_UNTIL[account_id] = time.monotonic() + retry_after
+        return {
+            **cached_row,
+            "success": False,
+            "rate_limited": True,
+            "data": status,
+            "retryable": True,
+            "retry_after_seconds": retry_after,
+            "error": _checkin_claim_error(status),
+        }
+
+    # A successful claim can be visible at the status endpoint a little later.
+    # Keep accepted state monotonic during the grace window without issuing
+    # extra automatic verification probes.
+    now = time.monotonic()
+    accepted_until = _CHECKIN_ACCEPTED_UNTIL.get(account_id, 0.0)
+    if status.get("checked_in") is True:
+        _CHECKIN_ACCEPTED_UNTIL.pop(account_id, None)
+        status = {**status, "verification_pending": False}
+        # The account is done for today, so a leftover 9074 backoff would only
+        # block tomorrow's first claim. Retire it together with the cooldown.
+        _CHECKIN_COOLDOWN_UNTIL.pop(account_id, None)
+        _CHECKIN_STATUS_COOLDOWN_UNTIL.pop(account_id, None)
+        if _checkin_retry_state(account_id)[0]:
+            _checkin_clear_retry_state(account_id)
+    elif respect_pending and accepted_until > now:
+        status = {
+            **status,
+            "checked_in": True,
+            "verification_pending": True,
+        }
+    elif accepted_until:
+        _CHECKIN_ACCEPTED_UNTIL.pop(account_id, None)
+
+    merged = auth.merge_account_checkin(account_id, status)
+    row = {
+        **cached_row,
+        "checked_in": status.get("checked_in"),
+        "credits": status.get("credits"),
+        "checkin_enable": status.get("enable"),
+        "checkin": status,
+        "account_credits": merged.get("account_credits"),
+        "checkin_updated_at": auth.get_account_record(account_id).get(
+            "checkin_status_updated_at",
+            auth.get_account_record(account_id).get(
+                "checkin_updated_at", cached_row.get("checkin_updated_at", 0)
+            ),
+        ),
+    }
+    if cooldown_remaining and status.get("checked_in") is not True:
+        # Report the live status and keep the claim window visible so the UI
+        # does not invite a claim the upstream will reject with 9074.
+        row.update(
+            {
+                "claim_rate_limited": True,
+                "retryable": True,
+                "retry_after_seconds": cooldown_remaining,
+            }
+        )
+    return row
+
+
+async def _fetch_checkin_account_snapshot(
+    account_id: str,
+    rec: dict | None = None,
+    *,
+    respect_pending: bool = True,
+) -> dict:
+    """Backward-compatible name for a checkin-only account refresh."""
+    return await _fetch_checkin_status_snapshot(
+        account_id,
+        rec,
+        respect_pending=respect_pending,
+        use_cached_on_cooldown=True,
+    )
+
+def _checkin_claim_error(data: dict) -> str:
+    """Format an upstream business-code failure without hiding its cause."""
+    data = data if isinstance(data, dict) else {}
+    code = data.get("code")
+    message = data.get("message") or data.get("error") or "unknown upstream error"
+    if code == 9074:
+        retry_after = max(1, int(CHECKIN_RETRY_AFTER))
+        message = f"{message}; upstream rate limit, retry after at least {retry_after}s"
+    return f"Trae checkin failed [{code}]: {message}"
+
+
+def _checkin_claim_ok(data: dict) -> bool:
+    """Only code=0 is a successful claim; HTTP 200 alone is insufficient."""
+    return isinstance(data, dict) and data.get("code") == 0
+
+
+def _checkin_account_lock(account_id: str) -> asyncio.Lock:
+    """Return an account lock that is safe across test event loops/reloads."""
+    lock = _CHECKIN_ACCOUNT_LOCKS.get(account_id)
+    current_loop = asyncio.get_running_loop()
+    bound_loop = getattr(lock, "_loop", None) if lock is not None else None
+    if lock is None or (bound_loop is not None and bound_loop is not current_loop):
+        lock = asyncio.Lock()
+        _CHECKIN_ACCOUNT_LOCKS[account_id] = lock
+    return lock
+
+
+def _checkin_claim_gate() -> asyncio.Lock:
+    """Serialize actual upstream claims and enforce the configured interval."""
+    global _CHECKIN_CLAIM_GATE, _CHECKIN_CLAIM_GATE_LOOP
+    current_loop = asyncio.get_running_loop()
+    if _CHECKIN_CLAIM_GATE is None or _CHECKIN_CLAIM_GATE_LOOP is not current_loop:
+        _CHECKIN_CLAIM_GATE = asyncio.Lock()
+        _CHECKIN_CLAIM_GATE_LOOP = current_loop
+    return _CHECKIN_CLAIM_GATE
+
+
+def _checkin_status_cooldown_remaining(account_id: str) -> int:
+    """Return the remaining window after the *status* endpoint returned 9074.
+
+    This is deliberately in-memory only: a claim-side 9074 is common and
+    persisted, while a status-side 9074 is rare and must not survive a restart
+    as a permanent read block.
+    """
+
+    until = _CHECKIN_STATUS_COOLDOWN_UNTIL.get(account_id, 0.0)
+    remaining = until - time.monotonic()
+    if remaining <= 0:
+        _CHECKIN_STATUS_COOLDOWN_UNTIL.pop(account_id, None)
+        return 0
+    return max(1, int(remaining))
+
+
+def _checkin_cooldown_remaining(account_id: str) -> int:
+    until = _CHECKIN_COOLDOWN_UNTIL.get(account_id, 0.0)
+    remaining = until - time.monotonic()
+    if remaining <= 0:
+        _CHECKIN_COOLDOWN_UNTIL.pop(account_id, None)
+        # Fall back to persisted wall-clock retry deadline so a container
+        # restart does not immediately re-hammer a still-limited upstream.
+        rec = auth.get_account_record(account_id)
+        checkin = rec.get("checkin") or {}
+        backoff = float(checkin.get("retry_backoff") or 0)
+        updated = float(checkin.get("retry_updated_at") or 0)
+        if backoff > 0 and updated > 0:
+            persisted_remaining = (updated + backoff) - time.time()
+            if persisted_remaining > 0:
+                remaining = persisted_remaining
+    if remaining <= 0:
+        return 0
+    return max(1, int(remaining + 0.999))
+
+
+def _checkin_retry_state(account_id: str) -> tuple[float, int]:
+    """Return persisted (retry_after_backoff, consecutive_9074_count)."""
+    rec = auth.get_account_record(account_id)
+    checkin = rec.get("checkin") or {}
+    backoff = float(checkin.get("retry_backoff") or 0)
+    count = int(checkin.get("retry_9074_count") or 0)
+    return backoff, count
+
+
+def _checkin_persist_retry_state(
+    account_id: str, backoff: float, count: int
+) -> None:
+    auth.merge_account_retry(
+        account_id,
+        {
+            "retry_backoff": backoff,
+            "retry_9074_count": count,
+            "retry_updated_at": time.time(),
+        },
+    )
+
+
+def _checkin_clear_retry_state(account_id: str) -> None:
+    auth.merge_account_retry(
+        account_id,
+        {
+            "retry_backoff": 0,
+            "retry_9074_count": 0,
+        },
+    )
+
+
+def _checkin_next_backoff(account_id: str) -> float:
+    """Exponential backoff for one account's 9074 streak."""
+    _, count = _checkin_retry_state(account_id)
+    base = max(1.0, float(CHECKIN_RETRY_AFTER))
+    # 9074 is an upstream capacity signal ("too many users"), not a penalty for
+    # this account, and each retry now also rotates the device id. Escalate
+    # gently so a still-unclaimed account keeps getting attempts within the
+    # day instead of parking on the hour-long ceiling.
+    backoff = base * (2 ** min(count, CHECKIN_9074_BACKOFF_EXPONENT_CAP))
+    max_backoff = max(base, float(CHECKIN_9074_MAX_BACKOFF))
+    return max(base, min(backoff, max_backoff))
+
+
+def _checkin_start_cooldown(account_id: str, retry_after: float | None = None) -> int:
+    """Start one account's local cooldown after an upstream 9074 response."""
+    if retry_after is None:
+        retry_after = _checkin_next_backoff(account_id)
+    retry_after = max(1, int(retry_after))
+    _CHECKIN_COOLDOWN_UNTIL[account_id] = time.monotonic() + retry_after
+    _, count = _checkin_retry_state(account_id)
+    _checkin_persist_retry_state(account_id, float(retry_after), count + 1)
+    return retry_after
+
+
+def _checkin_mark_accepted(account_id: str, snapshot: dict, *, pending: bool) -> None:
+    """Persist a successful claim without allowing missing fields to erase cache."""
+    cached = auth.get_account_record(account_id).get("checkin") or {}
+    checkin = dict(cached)
+    checkin.update(snapshot.get("checkin") or {})
+    checkin["checked_in"] = True
+    if pending:
+        checkin["verification_pending"] = True
+    else:
+        checkin.pop("verification_pending", None)
+    for key in ("account_credits",):
+        value = snapshot.get(key)
+        if value is not None:
+            checkin[key] = value
+    auth.merge_account_checkin(account_id, checkin)
+
+
+def _checkin_cooldown_payload(snapshot: dict, retry_after: int) -> dict:
+    data = {
+        "code": 9074,
+        "message": "local cooldown active; upstream claim was not sent",
+    }
+    return {
+        **snapshot,
+        "success": False,
+        "skipped": True,
+        "claim_sent": False,
+        "data": data,
+        "retryable": True,
+        "retry_after_seconds": retry_after,
+        "error": f"Trae checkin skipped [9074]: local cooldown active; retry after at least {retry_after}s",
+    }
+
+
+def _checkin_device_rotation_enabled() -> bool:
+    """Whether a 9074 claim may rotate to a fresh device id.
+
+    Set ``TRAE_CHECKIN_NO_DEVICE_ROTATION=1`` to keep one fixed id per account.
+    """
+
+    return str(
+        os.environ.get("TRAE_CHECKIN_NO_DEVICE_ROTATION", "")
+    ).strip().lower() not in {"1", "true", "yes", "on"}
+
+
+async def _claim_checkin_throttled(account_id: str, token: str) -> tuple[dict | None, int]:
+    """Send at most one claim after account cooldown and global spacing checks."""
+    remaining = _checkin_cooldown_remaining(account_id)
+    if remaining:
+        return None, remaining
+
+    global _CHECKIN_NEXT_CLAIM_AT
+    async with _checkin_claim_gate():
+        remaining = _checkin_cooldown_remaining(account_id)
+        if remaining:
+            return None, remaining
+        wait_for = max(0.0, _CHECKIN_NEXT_CLAIM_AT - time.monotonic())
+        if wait_for:
+            await asyncio.sleep(wait_for)
+        try:
+            data = await trae_client.claim_checkin_credits(token, account_id)
+        finally:
+            _CHECKIN_NEXT_CLAIM_AT = time.monotonic() + max(0.0, CHECKIN_INTERVAL)
+
+        if data.get("code") == 9074:
+            # 9074 is scoped to the device id, not the account: the same token
+            # claims successfully on a freshly derived id. Rotate once and retry
+            # before falling back to a timed cooldown.
+            if _checkin_device_rotation_enabled() and trae_client.rotate_checkin_device_id(
+                token, account_id
+            ):
+                logger.info(
+                    "checkin 9074 account=%s: rotated device id, retrying once",
+                    account_id,
+                )
+                try:
+                    data = await trae_client.claim_checkin_credits(token, account_id)
+                finally:
+                    _CHECKIN_NEXT_CLAIM_AT = time.monotonic() + max(
+                        0.0, CHECKIN_INTERVAL
+                    )
+        if data.get("code") == 9074:
+            retry_after = _checkin_start_cooldown(account_id)
+            until = time.monotonic() + retry_after
+            _CHECKIN_NEXT_CLAIM_AT = max(_CHECKIN_NEXT_CLAIM_AT, until)
+            return data, retry_after
+        if _checkin_claim_ok(data):
+            _CHECKIN_COOLDOWN_UNTIL.pop(account_id, None)
+            _checkin_clear_retry_state(account_id)
+        return data, 0
+
+
+async def _claim_checkin_account(account_id: str) -> dict:
+    """Lock, use today's cache when available, and send at most one claim."""
+    lock = _checkin_account_lock(account_id)
+    async with lock:
+        record = auth.get_account_record(account_id)
+        token = record.get("token") or ""
+        if not token:
+            return {
+                "success": False,
+                "id": account_id,
+                "error": "account not found or token missing",
+            }
+
+        before = _cached_checkin_account_snapshot(account_id, record)
+        accepted_recently = _CHECKIN_ACCEPTED_UNTIL.get(account_id, 0.0) > time.monotonic()
+        if accepted_recently:
+            before["checked_in"] = True
+            before["verification_pending"] = True
+        if before.get("checked_in") is True and (
+            accepted_recently or _checkin_cache_is_today(record)
+        ):
+            _CHECKIN_COOLDOWN_UNTIL.pop(account_id, None)
+            _checkin_clear_retry_state(account_id)
+            return {
+                **before,
+                "success": True,
+                "skipped": True,
+                "claim_sent": False,
+                "data": {"code": 0, "message": "already checked in, skipped"},
+            }
+
+        cooldown = _checkin_cooldown_remaining(account_id)
+        if cooldown:
+            return _checkin_cooldown_payload(before, cooldown)
+
+        try:
+            data, retry_after = await _claim_checkin_throttled(account_id, token)
+        except Exception as exc:
+            return {**before, "success": False, "claim_sent": False, "error": str(exc)}
+
+        if data is None:
+            return _checkin_cooldown_payload(before, retry_after)
+
+        if _checkin_auth_failed(data) and await auth.refresh_account(account_id):
+            # Server-side token invalidation: rotate this account and retry the
+            # claim once instead of surfacing a transient auth error.
+            fresh = auth.get_account_record(account_id)
+            data, retry_after = await _claim_checkin_throttled(
+                account_id, fresh.get("token") or ""
+            )
+            if data is None:
+                return _checkin_cooldown_payload(before, retry_after)
+
+        if data.get("code") == 9074:
+            # A 9074 response is already a rate-limit signal.  Querying status
+            # immediately after it only compounds the upstream frequency limit.
+            payload = _checkin_cooldown_payload(before, retry_after)
+            payload["skipped"] = False
+            payload["claim_sent"] = True
+            payload["data"] = data
+            payload["error"] = _checkin_claim_error(data)
+            return payload
+
+        if not _checkin_claim_ok(data):
+            return {
+                **before,
+                "success": False,
+                "skipped": False,
+                "claim_sent": True,
+                "data": data,
+                "error": _checkin_claim_error(data),
+            }
+
+        # Code 0 is an accepted claim.  Persist it immediately; the explicit
+        # status button can verify later without making the claim path noisy.
+        _CHECKIN_ACCEPTED_UNTIL[account_id] = time.monotonic() + max(
+            10.0, float(CHECKIN_RETRY_AFTER)
+        )
+        _CHECKIN_COOLDOWN_UNTIL.pop(account_id, None)
+        _checkin_clear_retry_state(account_id)
+        latest = {**before, "checked_in": True, "verification_pending": True}
+        _checkin_mark_accepted(account_id, latest, pending=True)
+
+        payload = {
+            **latest,
+            "success": True,
+            "skipped": False,
+            "claim_sent": True,
+            "data": data,
+            "checked_in": True,
+        }
+        payload["verification_pending"] = True
+        return payload
+
+
+@app.post("/api/checkin/claim-all")
+async def api_checkin_claim_all():
+    """One-click polling checkin for every stored account.
+
+    Claims are strictly ordered, and this endpoint does not perform a status or
+    credit refresh.  The separate dashboard query buttons own those reads;
+    keeping them out of this path prevents a claim burst from becoming a 9074
+    burst as well.
+    """
+    raw_accounts = list(auth.get_accounts_raw())
+    active_id = auth.get_active_account_id()
+    results = []
+    for aid, rec in raw_accounts:
+        token = rec.get("token") or ""
+        row = _cached_checkin_account_snapshot(aid, rec)
+        row["is_active"] = aid == active_id
+        if not token:
+            row["success"] = False
+            row["skipped"] = False
+            row["error"] = "No token"
+            results.append(row)
+            continue
+        claimed = await _claim_checkin_account(row["id"])
+        results.append({**row, **claimed})
+    return JSONResponse({"success": True, "accounts": results, "interval": CHECKIN_INTERVAL})
+
+@app.post("/api/checkin/claim-credits")
+async def api_checkin_claim_credits():
+    """Credit-ordered polling checkin.
+
+    First fetches total entitlement credits for every account, sorts
+    accounts by remaining credits descending (higher credits first),
+    then processes them one by one with the standard interval.
+    """
+    results = []
+    raw_accounts = list(auth.get_accounts_raw())
+    records_by_id = {account_id: record for account_id, record in raw_accounts}
+    enriched = []
+
+    for aid, rec in raw_accounts:
+        token = rec.get("token") or ""
+        label = rec.get("label") or rec.get("user_id") or aid
+        row = {
+            "id": aid,
+            "label": label,
+            "user_id": rec.get("user_id", ""),
+            "is_active": aid == auth.get_active_account_id(),
+        }
+        if not token:
+            row["success"] = False
+            row["error"] = "No token"
+            row["credits_sort"] = -1
+            enriched.append(row)
+            continue
+
+        cached = rec.get("checkin") or {}
+        row["checked_in"] = cached.get("checked_in")
+        row["checkin"] = cached
+
+        credits_sort = 0
+        try:
+            full = await _fetch_full_credits(token)
+            row.update(full)
+            parsed = full.get("account_credits") or {}
+            # Every pack lives in the merged 通用积分 pool, so the single
+            # account_credits value drives the credit-priority ordering.
+            credits_sort = parsed.get("remaining") or parsed.get("total_limit") or 0
+            if parsed.get("unlimited"):
+                credits_sort = 999999999
+            fresh_checkin = dict(rec.get("checkin") or {})
+            fresh_checkin.update({key: value for key, value in full.items() if value is not None})
+            row["checkin"] = auth.merge_account_credits(aid, fresh_checkin)
+        except Exception:
+            row["account_credits"] = None
+            credits_sort = 0
+
+        row["credits_sort"] = credits_sort
+        enriched.append(row)
+
+    # Sort by credits descending (richer accounts first)
+    enriched.sort(key=lambda x: x.get("credits_sort", 0), reverse=True)
+
+    for row in enriched:
+        if row.get("error"):
+            results.append(row)
+            continue
+        if row.get("checked_in") is True and _checkin_cache_is_today(
+            records_by_id.get(row["id"], {})
+        ):
+            row["success"] = True
+            row["skipped"] = True
+            row["data"] = {"code": 0, "message": "already checked in, skipped"}
+            results.append(row)
+            continue
+        claimed = await _claim_checkin_account(row["id"])
+        results.append({**row, **claimed})
+
+    for r in results:
+        if "credits_sort" in r:
+            del r["credits_sort"]
+
+    return JSONResponse({"success": True, "accounts": results, "interval": CHECKIN_INTERVAL})
+
+@app.get("/api/checkin/account/{account_id}")
+async def api_checkin_account_status(account_id: str):
+    """Refresh only the requested account without sending a claim."""
+    try:
+        return JSONResponse(await _fetch_checkin_account_snapshot(account_id))
+    except KeyError as exc:
+        return JSONResponse({"success": False, "error": str(exc.args[0])}, status_code=404)
+    except Exception as exc:
+        return JSONResponse({"success": False, "error": str(exc)}, status_code=502)
+
+
+@app.post("/api/checkin/account/{account_id}")
+async def api_checkin_account(account_id: str):
+    """Check in one account, avoiding duplicate or parallel claim requests."""
+    if not (auth.get_account_record(account_id).get("token") or ""):
+        return JSONResponse(
+            {"success": False, "error": "account not found or token missing"},
+            status_code=404,
+        )
+    return JSONResponse(await _claim_checkin_account(account_id))
+
+@app.post("/api/checkin/claim")
+async def api_checkin_claim():
+    account_id = auth.get_active_account_id()
+    if not account_id:
+        return JSONResponse(
+            {"success": False, "error": "no active account"}, status_code=404
+        )
+    return JSONResponse(await _claim_checkin_account(account_id))
+
+# ---- Account management & settings endpoints ----
+
+@app.post("/api/logout")
+async def api_logout():
+    auth.logout_active()
+    return JSONResponse({"success": True})
+
+
+@app.get("/api/accounts")
+async def api_accounts():
+    accounts = auth.list_accounts()
+    polling = auth.get_polling_status()
+    return JSONResponse({"success": True, "accounts": accounts, "polling": polling, "active": polling.get("active_account", "")})
+
+
+@app.post("/api/accounts/switch")
+async def api_accounts_switch(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"success": False, "error": "Invalid JSON body"}, status_code=400)
+    account_id = body.get("account_id") or body.get("id") or ""
+    if not account_id:
+        return JSONResponse({"success": False, "error": "account_id is required"}, status_code=400)
+    ok = auth.switch_account(account_id)
+    if not ok:
+        return JSONResponse({"success": False, "error": "account not found"}, status_code=404)
+    accounts = auth.list_accounts()
+    active = auth.get_active_account_id()
+    account = next((item for item in accounts if item.get("id") == active), None)
+    return JSONResponse(
+        {
+            "success": True,
+            "active": active,
+            "account": account,
+            "accounts": accounts,
+        },
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.post("/api/accounts/model-enabled")
+async def api_accounts_model_enabled(request: Request):
+    """Toggle whether one account receives new model requests.
+
+    This endpoint intentionally does not touch check-in state.  Disabled
+    accounts remain visible and continue to participate in all daily
+    check-in/status/credits operations.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            {"success": False, "error": "Invalid JSON body"}, status_code=400
+        )
+    if not isinstance(body, dict):
+        return JSONResponse(
+            {"success": False, "error": "JSON body must be an object"}, status_code=400
+        )
+    account_id = body.get("account_id") or body.get("id") or ""
+    if not isinstance(account_id, str) or not account_id.strip():
+        return JSONResponse(
+            {"success": False, "error": "account_id is required"}, status_code=400
+        )
+    if "enabled" not in body and "model_enabled" not in body:
+        return JSONResponse(
+            {"success": False, "error": "enabled is required"}, status_code=400
+        )
+    value = body.get("enabled", body.get("model_enabled"))
+    if isinstance(value, bool):
+        enabled = value
+    elif isinstance(value, str) and value.strip().lower() in {"true", "false"}:
+        enabled = value.strip().lower() == "true"
+    else:
+        return JSONResponse(
+            {"success": False, "error": "enabled must be a boolean"}, status_code=400
+        )
+    account_id = account_id.strip()
+    if not auth.set_account_model_enabled(account_id, enabled):
+        return JSONResponse(
+            {"success": False, "error": "account not found"}, status_code=404
+        )
+    account = next(
+        (item for item in auth.list_accounts() if item.get("id") == account_id),
+        None,
+    )
+    return JSONResponse(
+        {
+            "success": True,
+            "account": account,
+            "account_id": account_id,
+            "model_enabled": bool(account and account.get("model_enabled", enabled)),
+        },
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.post("/api/accounts/remove")
+async def api_accounts_remove(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"success": False, "error": "Invalid JSON body"}, status_code=400)
+    account_id = body.get("account_id") or body.get("id") or ""
+    if not account_id:
+        return JSONResponse({"success": False, "error": "account_id is required"}, status_code=400)
+    ok = auth.remove_account(account_id)
+    if not ok:
+        return JSONResponse({"success": False, "error": "account not found"}, status_code=404)
+    return JSONResponse({"success": True})
+
+
+@app.post("/api/settings")
+async def api_settings(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"success": False, "error": "Invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"success": False, "error": "JSON body must be an object"}, status_code=400)
+    web_base_url = body.get("web_base_url") or ""
+    upstream_mode = body.get("upstream_mode") or ""
+    endpoint_id = body.get("endpoint_id")
+    # Older clients only know URL/mode and do not send the newer preset
+    # identity.  Keep ``None`` for a port-only update, where the existing
+    # endpoint must remain untouched; endpoint-field updates are migrated below.
+    endpoint_fields_present = (
+        "web_base_url" in body or "upstream_mode" in body or "endpoint_id" in body
+    )
+    legacy_endpoint_update = endpoint_id is None and endpoint_fields_present
+    if not isinstance(web_base_url, str) or not isinstance(upstream_mode, str):
+        return JSONResponse({"success": False, "error": "URL and mode must be strings"}, status_code=400)
+    if endpoint_id is not None and not isinstance(endpoint_id, str):
+        return JSONResponse({"success": False, "error": "endpoint_id must be a string"}, status_code=400)
+    web_base_url = web_base_url.strip().rstrip("/")
+    upstream_mode = upstream_mode.strip().lower()
+    endpoint_id = endpoint_id.strip().lower() if isinstance(endpoint_id, str) else None
+    if endpoint_id:
+        endpoint = next(
+            (
+                item
+                for item in UPSTREAM_ENDPOINT_PRESETS
+                if str(item.get("id") or "").strip().lower() == endpoint_id
+            ),
+            None,
+        )
+        if endpoint is None:
+            return JSONResponse(
+                {"success": False, "error": f"Unsupported endpoint preset: {endpoint_id}"},
+                status_code=400,
+            )
+        # The preset id is authoritative.  This prevents a stale client URL or
+        # mode field from turning Work Agent into Remote (or IDE Agent into Raw).
+        if not web_base_url:
+            web_base_url = str(endpoint["base_url"]).rstrip("/")
+        if not upstream_mode:
+            upstream_mode = str(endpoint["mode"]).strip().lower()
+        if web_base_url != str(endpoint["base_url"]).rstrip("/") or upstream_mode != str(endpoint["mode"]).strip().lower():
+            return JSONResponse(
+                {"success": False, "error": "endpoint_id does not match URL/mode"},
+                status_code=400,
+            )
+    elif legacy_endpoint_update and (web_base_url or upstream_mode):
+        # Older clients only sent URL/mode.  Migrate those updates to the
+        # unique preset when possible, and clear a stale shared-URL identity
+        # when the update is custom or ambiguous.  Without this step a prior
+        # ``raw``/``remote`` id can survive a legacy update and overwrite the
+        # newly selected mode after the next restart.
+        matches = [
+            item
+            for item in UPSTREAM_ENDPOINT_PRESETS
+            if (
+                not web_base_url
+                or web_base_url == str(item.get("base_url") or "").rstrip("/")
+            )
+            and (
+                not upstream_mode
+                or upstream_mode == str(item.get("mode") or "").strip().lower()
+            )
+        ]
+        endpoint_id = (
+            str(matches[0].get("id") or "").strip().lower()
+            if len(matches) == 1
+            else ""
+        )
+    relay_port = body.get("relay_port", body.get("port", 0))
+    port_requested = "relay_port" in body or "port" in body
+    if upstream_mode and upstream_mode not in _VALID_UPSTREAM_MODES:
+        return JSONResponse(
+            {"success": False, "error": f"Unsupported upstream mode: {upstream_mode}"},
+            status_code=400,
+        )
+    if port_requested:
+        if (
+            isinstance(relay_port, bool)
+            or not isinstance(relay_port, (int, str))
+            or not str(relay_port).strip().isdigit()
+        ):
+            return JSONResponse({"success": False, "error": "relay_port must be an integer between 1 and 65535"}, status_code=400)
+        relay_port = int(relay_port)
+        if not 1 <= relay_port <= 65535:
+            return JSONResponse({"success": False, "error": "relay_port must be between 1 and 65535"}, status_code=400)
+    if not web_base_url and not relay_port and not upstream_mode and endpoint_id is None:
+        return JSONResponse({"success": False, "error": "nothing to update"}, status_code=400)
+    relay_settings = {
+        "web_base_url": web_base_url,
+        "port": relay_port,
+        "upstream_mode": upstream_mode,
+    }
+    # Keep the new keyword out of port-only calls for compatibility with
+    # older store adapters.  Passing ``None`` is semantically equivalent in
+    # the current adapter, but legacy wrappers may treat it as an overwrite.
+    if endpoint_id is not None:
+        relay_settings["endpoint_id"] = endpoint_id
+    auth.set_relay_settings(**relay_settings)
+    if upstream_mode:
+        # Synchronise the running module so _current_upstream_mode() reflects
+        # the new preset immediately without a container restart.
+        global UPSTREAM_MODE
+        UPSTREAM_MODE = upstream_mode
+        os.environ["UPSTREAM_MODE"] = upstream_mode
+    note = (
+        "Relay 端口已保存；需同步 Docker 端口映射并重启容器生效"
+        if relay_port
+        else "上游端点设置已保存"
+    )
+    return JSONResponse(
+        {
+            "success": True,
+            "note": note,
+            "settings": auth.get_settings(),
+        }
+    )
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+@app.get("/api/auto-route")
+async def api_get_auto_route():
+    return JSONResponse(
+        {
+            "success": True,
+            **auth.get_auto_route_settings(),
+            "tool_endpoint": AUTO_ROUTE_TOOL_ENDPOINT,
+            "chat_endpoint": AUTO_ROUTE_CHAT_ENDPOINT,
+        }
+    )
+
+
+@app.post("/api/auto-route")
+async def api_set_auto_route(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"success": False, "error": "Invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict) or "enabled" not in body:
+        return JSONResponse({"success": False, "error": "enabled is required"}, status_code=400)
+    settings = auth.set_auto_route_settings(_truthy(body.get("enabled")))
+    return JSONResponse({"success": True, **settings})
+
+
+@app.get("/api/auto-checkin")
+async def api_get_auto_checkin():
+    return JSONResponse(_auto_checkin_payload(), headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/auto-checkin")
+async def api_set_auto_checkin(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"success": False, "error": "Invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict) or "enabled" not in body:
+        return JSONResponse({"success": False, "error": "enabled is required"}, status_code=400)
+    try:
+        auth.set_auto_checkin_settings(_truthy(body.get("enabled")), body.get("time"))
+    except ValueError as exc:
+        return JSONResponse({"success": False, "error": str(exc)}, status_code=400)
+    return JSONResponse(_auto_checkin_payload())
+
+
+@app.post("/api/auto-checkin/run")
+async def api_run_auto_checkin():
+    if _AUTO_CHECKIN_LOCK.locked():
+        return JSONResponse({**_auto_checkin_payload(), "started": False, "error": "already running"})
+    asyncio.create_task(_auto_checkin_cycle("manual"))
+    await asyncio.sleep(0)
+    return JSONResponse({**_auto_checkin_payload(), "started": True})
+
+
+@app.get("/api/max-mode")
+async def api_get_max_mode():
+    return JSONResponse({"success": True, **auth.get_max_mode_settings()})
+
+
+@app.post("/api/max-mode")
+async def api_set_max_mode(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"success": False, "error": "Invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict) or "enabled" not in body:
+        return JSONResponse({"success": False, "error": "enabled is required"}, status_code=400)
+    models = body.get("models", "")
+    if models is None:
+        models = ""
+    if not isinstance(models, (str, list)):
+        return JSONResponse(
+            {"success": False, "error": "models must be a string or list"}, status_code=400
+        )
+    settings = auth.set_max_mode_settings(_truthy(body.get("enabled")), models)
+    return JSONResponse({"success": True, **settings})
+
+
+def _max_context_of(config: Mapping[str, Any]) -> int:
+    size = config.get("context_window_size")
+    if isinstance(size, Mapping):
+        raw = size.get("max")
+        if isinstance(raw, list):
+            raw = raw[0] if raw else None
+        if raw:
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                pass
+    tokens = config.get("context_window_tokens")
+    if isinstance(tokens, Mapping) and tokens.get("max"):
+        try:
+            return int(tokens.get("max"))
+        except (TypeError, ValueError):
+            pass
+    return 0
+
+
+@app.get("/api/max-mode/models")
+async def api_max_mode_models():
+    """List Agent-tier models the active account marks with ``max_mode``."""
+
+    account_id, record = auth.get_active_account_snapshot()
+    token = str((record or {}).get("token") or "") or str(auth.get_token() or "")
+    if not token:
+        return JSONResponse({"success": False, "error": "没有可用账号"}, status_code=400)
+    provider = (record or {}).get("provider_specific") or (record or {}).get(
+        "providerSpecificData"
+    )
+    configs = await trae_client._fetch_web_model_configs(
+        token_override=token,
+        provider_specific=dict(provider) if isinstance(provider, Mapping) else None,
+        agent_type="solo_agent_remote",
+    )
+    models = [
+        {
+            "name": name,
+            "display_name": str(cfg.get("display_name") or name),
+            "max_context": _max_context_of(cfg),
+        }
+        for name, cfg in configs.items()
+        if isinstance(cfg, Mapping) and cfg.get("max_mode")
+    ]
+    if not configs:
+        return JSONResponse(
+            {"success": False, "error": "上游模型列表获取失败"}, status_code=502
+        )
+    return JSONResponse({"success": True, "account_id": account_id, "models": models})
+
+
+@app.get("/api/polling")
+async def api_get_polling():
+    polling = auth.get_polling_status()
+    return JSONResponse({"success": True, "enabled": polling.get("enabled", False), "mode": polling.get("mode", "round-robin")})
+
+
+@app.post("/api/polling-mode")
+async def api_polling_mode(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"success": False, "error": "Invalid JSON body"}, status_code=400)
+    mode = (body.get("mode") or "").strip()
+    if not mode:
+        return JSONResponse({"success": False, "error": "mode is required"}, status_code=400)
+    if mode not in ("round-robin", "credit-priority"):
+        return JSONResponse({"success": False, "error": "mode must be round-robin or credit-priority"}, status_code=400)
+    auth.set_polling_mode(mode)
+    return JSONResponse({"success": True, "mode": mode})
+@app.post("/api/polling")
+async def api_polling(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"success": False, "error": "Invalid JSON body"}, status_code=400)
+    enabled = bool(body.get("enabled", False))
+    auth.set_polling(enabled)
+    mode = (body.get("mode") or "").strip()
+    if mode in ("round-robin", "credit-priority"):
+        auth.set_polling_mode(mode)
+    polling = auth.get_polling_status()
+    return JSONResponse({"success": True, "enabled": enabled, "mode": polling.get("mode", "round-robin")})

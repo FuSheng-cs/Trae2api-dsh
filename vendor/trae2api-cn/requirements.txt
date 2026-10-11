@@ -1,0 +1,6 @@
+fastapi==0.143.0
+anyio==4.15.1
+uvicorn==0.54.0
+httpx[socks]==0.28.1
+python-dotenv==1.2.4
+cryptography==49.0.0

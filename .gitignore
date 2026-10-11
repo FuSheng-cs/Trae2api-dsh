@@ -1,0 +1,10 @@
+work/
+node_modules/
+dist/
+*.log
+.env
+.venv/
+__pycache__/
+*.pyc
+data/
+*.tgz
