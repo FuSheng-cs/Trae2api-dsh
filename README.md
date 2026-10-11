@@ -21,6 +21,7 @@
 ## 运行要求
 
 - 本机 dsh **0.2.0-rc.2**，Node.js **22+**。未来 dsh 版本以 CI/兼容验证为准。
+- 本机 Web/CLI 的插件安装命令需要可用的 `pnpm`（10+）；Desktop 使用其自带的插件管理运行环境。
 - Python **3.10+**，包含 `venv` / `pip`。准备环境需要连接 Python 包镜像。
 - 已登录、具有目标模型使用权限的 **Trae CN / TRAE SOLO CN** 账号。
 - Windows 10/11；Linux/macOS 提供同一安装流程与生命周期实现，实际支持范围以 CI 为准。

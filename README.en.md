@@ -13,6 +13,8 @@ pinned to v1.0.4; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). This is 
 
 Requires local dsh 0.2.0-rc.2, Node 22+, Python 3.10+ with venv/pip, and an
 authorized TRAE CN or SOLO CN account with access to the selected model.
+Local Web/CLI plugin installation also requires `pnpm` 10+ on PATH; Desktop
+uses its bundled plugin-management runtime.
 
 ```sh
 dsh plugin --profile web add https://github.com/FuSheng-cs/dsh-trae-relay/releases/latest/download/dsh-trae-relay.tgz
