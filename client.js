@@ -46,6 +46,7 @@ window.__ModuleLoader__.load({
         [port, setPort] = React.useState(""),
         [edition, setEdition] = React.useState("solo"),
         [directory, setDirectory] = React.useState("");
+      const [consoleURL, setConsoleURL] = React.useState("");
       const alive = React.useRef(true);
       const call = async (method, payload, signal) => {
         const r = await ctx.connection.rpc.call(
@@ -62,9 +63,15 @@ window.__ModuleLoader__.load({
         if (!alive.current) return;
         setState(status);
         if (status.state === "running") {
-          const data = await call("accounts", {}, signal);
-          if (alive.current) setAccounts(data.accounts || []);
-        }
+          const [data, url] = await Promise.all([
+            call("accounts", {}, signal),
+            call("console", {}, signal),
+          ]);
+          if (alive.current) {
+            setAccounts(data.accounts || []);
+            setConsoleURL(url);
+          }
+        } else setConsoleURL("");
       };
       React.useEffect(() => {
         alive.current = true;
@@ -101,18 +108,17 @@ window.__ModuleLoader__.load({
           if (alive.current) setBusy(false);
         }
       };
-      const openConsole = async () => {
-        const popup = window.open("about:blank", "_blank");
-        if (popup) popup.opener = null;
-        setError("");
-        try {
-          const url = await call("console");
-          if (popup) popup.location.replace(url);
-          else setError("浏览器阻止了新窗口，请允许弹窗后重试。");
-        } catch (e) {
-          popup?.close();
-          setError(e.message);
-        }
+      const openedConsole = () => {
+        // Desktop redirects real HTTP links to the system browser and denies
+        // JavaScript popup handles. Keep the click a normal anchor navigation.
+        // Renew only after the browser has consumed the default click action.
+        setTimeout(() => {
+          if (!alive.current) return;
+          setConsoleURL("");
+          void refresh().catch((e) => {
+            if (alive.current) setError(e.message);
+          });
+        }, 0);
       };
       const button = (label, onClick, disabled = false, primary = false) =>
         h(
@@ -231,7 +237,19 @@ window.__ModuleLoader__.load({
                 true,
               ),
               button("停止服务", () => act("stop"), !running),
-              button("打开完整控制台", openConsole, !running),
+              running && !busy && consoleURL
+                ? h(
+                    "a",
+                    {
+                      className: "tr-button",
+                      href: consoleURL,
+                      target: "_blank",
+                      rel: "noopener noreferrer",
+                      onClick: openedConsole,
+                    },
+                    "打开完整控制台",
+                  )
+                : button("打开完整控制台", () => {}, true),
             ),
             h(
               "p",

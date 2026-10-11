@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.1
+
+- Open the full console with a normal authenticated HTTP link. This supports Desktop's system-browser redirect policy, which deliberately denies JavaScript popup handles.
+- Refresh one-use console entries while the panel is visible and after a click. Existing prepared Python environments remain compatible.
+
 ## 1.0.0
 
 - DSH native sidebar management page and authenticated full-console launcher.
