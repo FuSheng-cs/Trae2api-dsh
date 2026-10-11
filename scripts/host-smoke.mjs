@@ -7,6 +7,7 @@ import { RelayRuntime } from "../lib/runtime.js";
 const cli = resolve("work/test-host/node_modules/@deepseek-ai/dsh/lib/bin.js");
 const home = resolve("work/host-smoke-home");
 const runtimeHome = process.env.DSH_RELAY_TEST_HOME;
+const packageVersion = JSON.parse(await readFile('package.json','utf8')).version;
 if (!runtimeHome)
   throw new Error("Set DSH_RELAY_TEST_HOME to a prepared disposable runtime.");
 const env = {
@@ -40,7 +41,7 @@ await command([
   "--profile",
   "web",
   "add",
-  resolve("dsh-trae-relay-1.0.0.tgz"),
+  resolve(`dsh-trae-relay-${packageVersion}.tgz`),
 ]);
 const patch = join(home, "profiles", "web", "cordis.patch.yml");
 const fixture =
