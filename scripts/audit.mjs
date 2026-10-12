@@ -17,6 +17,7 @@ const roots = [
   "docs",
   "CONTRIBUTING.md",
   "MARKETPLACES.md",
+  "CHANGELOG.md",
 ];
 async function walk(path) {
   let files;

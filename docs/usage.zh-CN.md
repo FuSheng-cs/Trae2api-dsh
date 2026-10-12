@@ -58,6 +58,18 @@ Windows 初始化移除数据目录继承权限，仅授予当前用户与 SYSTE
 
 ## 卸载与恢复
 
+### 从旧包升级
+
+项目及 GitHub 仓库现名为 **Trae2api-dsh**，安装包名为 `trae2api-dsh`，通过 GitHub Release 分发。如果已安装旧包 `dsh-trae-relay`：
+
+1. 在旧插件控制台断开 dsh 模型接入、停止服务，然后移除旧插件；保留其数据目录。
+2. 完整退出 dsh 后，通过插件管理器安装新的 `trae2api-dsh.tgz`，再启用插件。
+3. 插件沿用原有账号、环境与显示偏好，重新接入模型菜单即可。
+
+不要同时启用新旧两个包。数据目录仍为 `.dsh/plugins/dsh-trae-relay`，`DSH_TRAE_RELAY_HOME`、`DSH_TRAE_RELAY_API_KEY` 和 `trae-relay` provider 标识保持兼容，不需要手动重命名这些配置。GitHub 旧仓库地址保留重定向；新版 Release 同时提供旧文件名的兼容下载。
+
+### 卸载与重新准备
+
 先停止服务/断开模型，再在插件管理器卸载。本插件不自动删除账号文件，避免卸载造成数据丢失。
 要彻底清理，完整退出 dsh 后手动删除上述插件数据目录，并在 dsh credential 管理中移除 `DSH_TRAE_RELAY_API_KEY`。
 重新安装可沿用插件数据；插件更新会刷新自己的 Python runner 文件，保留虚拟环境、账号和显示偏好。上游依赖/环境版本变化需要点 **重新准备环境**，准备前先停止服务并断开模型。准备时保留账号和设置。

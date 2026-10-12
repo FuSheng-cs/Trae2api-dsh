@@ -1,5 +1,7 @@
 # Third-party source
 
+The Trae2api-dsh icon at `assets/icon.png` was generated for this project using the built-in image-generation tool on 2026-10-13. It is an independent project mark, not an official TRAE or DeepSeek logo.
+
 `vendor/trae2api-cn` is a clean, attributed snapshot of
 [autumnsentiment/Trae2api-cn](https://github.com/autumnsentiment/Trae2api-cn),
 version **v1.0.4**, commit `85978c3d465b693ef0ae2d42be21ca0679bb1f6a`.

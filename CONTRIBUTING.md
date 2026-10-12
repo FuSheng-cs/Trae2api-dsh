@@ -1,6 +1,8 @@
 # Contributing
 
-Thanks for helping improve TRAE Relay for DSH. Please open an issue for a reproducible bug or a focused pull request for a change. Include the DSH/plugin versions, operating system and relevant error text, with credentials and personal information removed.
+Trae2api-dsh keeps the `trae-relay` RPC/provider identity, legacy data-directory name and credential/environment identifiers stable for upgrades. The public package and Client loader identity use `trae2api-dsh`; update the bundle name and client module ID together when changing package identity.
+
+Thanks for helping improve Trae2api-dsh. Please open an issue for a reproducible bug or a focused pull request for a change. Include the DSH/plugin versions, operating system and relevant error text, with credentials and personal information removed.
 
 ## Project structure
 

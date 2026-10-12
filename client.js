@@ -1,5 +1,5 @@
 window.__ModuleLoader__.load({
-  id: "dsh-trae-relay",
+  id: "trae2api-dsh",
   factory(require) {
     const React = require("react"),
       h = React.createElement,

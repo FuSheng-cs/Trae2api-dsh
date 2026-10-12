@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.0
+
+- Rename the public project and GitHub repository to Trae2api-dsh and the package to `trae2api-dsh`; align the bundle and Client loader names.
+- Add an original generated project icon to the package and both README headers.
+- Complete the bilingual READMEs with feature navigation, quick start, everyday use, updates, FAQ and links to dedicated documents, following GitHub's create-readme skill.
+- Retain legacy data paths, environment/credential names and provider/RPC identity; document upgrading from the previous package without enabling both versions at once.
+- Provide the new archive filename and an identical legacy filename for existing marketplace download links. Account/model/lifecycle behavior remains unchanged.
+
 ## 1.2.2
 
 - Reorganize both READMEs around project overview, core features, preview, quick start and common questions.

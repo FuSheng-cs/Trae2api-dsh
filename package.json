@@ -1,17 +1,17 @@
 {
-  "name": "dsh-trae-relay",
-  "version": "1.2.2",
-  "description": "Managed TRAE CN relay and account console for DeepSeek Harness",
+  "name": "trae2api-dsh",
+  "version": "1.3.0",
+  "description": "Trae2api-dsh: TRAE CN models, accounts and console for DeepSeek Harness",
   "type": "module",
   "license": "MIT",
   "author": "FuSheng-cs",
   "repository": {
     "type": "git",
-    "url": "https://github.com/FuSheng-cs/dsh-trae-relay.git"
+    "url": "https://github.com/FuSheng-cs/Trae2api-dsh.git"
   },
-  "homepage": "https://github.com/FuSheng-cs/dsh-trae-relay#readme",
+  "homepage": "https://github.com/FuSheng-cs/Trae2api-dsh#readme",
   "bugs": {
-    "url": "https://github.com/FuSheng-cs/dsh-trae-relay/issues"
+    "url": "https://github.com/FuSheng-cs/Trae2api-dsh/issues"
   },
   "engines": {
     "node": ">=22"
@@ -41,6 +41,7 @@
     "docs/*.md",
     "CONTRIBUTING.md",
     "MARKETPLACES.md",
+    "CHANGELOG.md",
     "assets/*.png",
     "screenshots.json"
   ],
@@ -72,5 +73,6 @@
     "trae",
     "openai-compatible",
     "relay"
-  ]
+  ],
+  "icon": "assets/icon.png"
 }

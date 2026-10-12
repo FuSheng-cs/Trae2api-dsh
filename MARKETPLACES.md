@@ -1,6 +1,6 @@
 # DSH 市场提交记录
 
-记录更新：2026-10-13（北京时间）。当前提交版本：[v1.2.2](https://github.com/FuSheng-cs/dsh-trae-relay/releases/tag/v1.2.2)。
+记录更新：2026-10-13（北京时间）。项目现名 **Trae2api-dsh**；最新发布见 [GitHub Release](https://github.com/FuSheng-cs/Trae2api-dsh/releases/latest)。以下包含已提交申请及历史验证快照。
 
 v1.2.2 重构了中英文 README，新增详细使用指南与贡献指南，免责声明入口移至首页文末并保留独立文件。运行功能不变；六个待审申请已更新版本说明，补充注册表的安装 tag 也更新为 v1.2.2。已合并的创意工坊条目继续指向同一维护仓库，无需重复登记。
 
@@ -8,7 +8,7 @@ v1.2.2 重构了中英文 README，新增详细使用指南与贡献指南，免
 
 | 渠道 | 本次处理 | 提交结果 |
 | --- | --- | --- |
-| awesome-dsh-plugin / dsh-market / dshmarket.com | 一天年龄门槛已满足，现有正式 PR 的年龄自查已更新；不做重复投稿或空提交。安装包指向最新版 v1.2.2。 | [PR #7164](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/pull/7164)，构建检查成功，年龄检查仍为达标前的旧结果，等待自动复检和审核。 |
+| awesome-dsh-plugin / dsh-market / dshmarket.com | 一天年龄门槛已满足，使用现有正式 PR 更新名称和最新版下载入口，不重复登记。 | [PR #7164](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/pull/7164)，等待自动复检和审核。 |
 | 创意工坊 / dsh-market.com | 社区索引 PR 于北京时间 2026-10-12 17:15:19 合并；已核实 main 索引、线上 manifest 和网页搜索结果均包含插件。 | **已上架**：[创意工坊](https://dsh-market.com/) → 插件 → 搜索 `TRAE`；[合并 PR #31](https://github.com/zhu1090093659/dsh-community-plugins/pull/31)，[线上清单](https://dsh-market.com/manifest/plugins.json)。 |
 | DSH Market / dsh.market | 按提交模板提供仓库、类型、作者简介、版本、安装方式与说明，已更新至 v1.2.2。 | [Issue #234](https://github.com/2BingLing/dsh-market/issues/234)，已收到自动确认，等待每日管道处理。 |
 | dshplugin.io | 按网站指定的 `plugin-submission` issue 入口提交，现有申请已更新至 v1.2.2。 | [Issue #34](https://github.com/tjsdyy/dshplugin/issues/34)，待审。 |
@@ -24,8 +24,8 @@ v1.2.2 重构了中英文 README，新增详细使用指南与贡献指南，免
 
 ## 版本与验证
 
-- [三系统 CI](https://github.com/FuSheng-cs/dsh-trae-relay/actions/runs/38321963539) 全部通过；release commit 为 `0a7fd6f1a27150d611f6ebda60dc3263a7c72fa2`。
-- [公开安装包](https://github.com/FuSheng-cs/dsh-trae-relay/releases/download/v1.2.2/dsh-trae-relay.tgz) 下载后校验通过，SHA-256：`bbbbe409d85d07706d6cad8313d9d0cd8a01a22e58e4479a91229a8b94d015a7`；[校验文件](https://github.com/FuSheng-cs/dsh-trae-relay/releases/download/v1.2.2/SHA256SUMS.txt)。
+- [三系统 CI](https://github.com/FuSheng-cs/Trae2api-dsh/actions/runs/38321963539) 全部通过；release commit 为 `0a7fd6f1a27150d611f6ebda60dc3263a7c72fa2`。
+- [v1.2.2 历史安装包](https://github.com/FuSheng-cs/Trae2api-dsh/releases/download/v1.2.2/dsh-trae-relay.tgz) 下载后校验通过，SHA-256：`bbbbe409d85d07706d6cad8313d9d0cd8a01a22e58e4479a91229a8b94d015a7`；[校验文件](https://github.com/FuSheng-cs/Trae2api-dsh/releases/download/v1.2.2/SHA256SUMS.txt)。
 - 安装包包含 [中文使用边界与免责声明](DISCLAIMER.md)、[English disclaimer](DISCLAIMER.en.md)、[上游署名及用途提示](THIRD_PARTY_NOTICES.md)，保留原始 MIT 许可证；声明不保证免除法律责任或赋予第三方服务权限。
 - 创意工坊索引校验通过，9 个索引测试通过；补充注册表 `npm run verify` 通过，8/8 条目有效并完成静态构建。
 - 运行时与 v1.2.0 一致：原有完整内嵌控制台、原生模型/思考档位菜单和控制台模型显示功能全部保留。

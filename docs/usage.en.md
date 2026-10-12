@@ -70,6 +70,16 @@ plugin state and removing its credential reference. An occupied port is refused;
 the plugin never adopts or terminates unrelated services. Setup preserves account
 data when repeated. No global Python, proxy or Git configuration is changed.
 
+## Upgrading from the previous package
+
+The project and repository are now named **Trae2api-dsh**, and the package name is `trae2api-dsh`, distributed through GitHub Releases. If you installed the previous `dsh-trae-relay` package:
+
+1. Disconnect its model route, stop the relay and remove the old plugin while retaining its data directory.
+2. Fully exit dsh, install the new `trae2api-dsh.tgz` archive, then enable the plugin.
+3. Reuse the existing accounts, environment and visibility preferences, and reconnect the model picker.
+
+Do not enable both packages together. The `.dsh/plugins/dsh-trae-relay` data path, `DSH_TRAE_RELAY_HOME`, `DSH_TRAE_RELAY_API_KEY` and `trae-relay` provider identifier remain compatible; do not rename them manually. The old GitHub repository address redirects to the new one, and new releases also provide the old archive filename for download compatibility.
+
 ## Related information
 
 [Usage boundaries and disclaimer](../DISCLAIMER.en.md) · [Third-party notices](../THIRD_PARTY_NOTICES.md)

@@ -7,11 +7,12 @@ import { createHash } from "node:crypto";
 import { installFixtureCatalog } from "./fixture-upstream.mjs";
 
 const cli = resolve("work/test-host/node_modules/@deepseek-ai/dsh/lib/bin.js");
-const home = resolve("work/host-smoke-home");
 const runtimeHome = process.env.DSH_RELAY_TEST_HOME;
-const packageVersion = JSON.parse(
+const packageInfo = JSON.parse(
   await readFile("package.json", "utf8"),
-).version;
+);
+const packageVersion = packageInfo.version;
+const home = resolve("work", "host-smoke-" + packageInfo.name);
 if (!runtimeHome)
   throw new Error("Set DSH_RELAY_TEST_HOME to a prepared disposable runtime.");
 const env = {
@@ -33,7 +34,7 @@ for (const key of [
   delete runtimeConfig[key];
 runtimeConfig.connected = false;
 await atomicJson(runtimeConfigPath, runtimeConfig);
-const archive = await readFile(`dsh-trae-relay-${packageVersion}.tgz`);
+const archive = await readFile(`${packageInfo.name}-${packageVersion}.tgz`);
 const isolatedArchive = resolve(
   "work",
   `host-smoke-${createHash("sha256").update(archive).digest("hex").slice(0, 16)}.tgz`,

@@ -5,7 +5,7 @@ Updated: 2026-10-12. Applies to the source, prebuilt package and marketplace des
 
 ## Independent community project
 
-dsh-trae-relay is an independent community integration. DeepSeek, TRAE and their affiliates do not provide, authorize, endorse or warrant this project. Product names and trademarks identify compatibility only and belong to their respective owners. Submission, listing or an installation check is not platform authorization, legal review or a security audit.
+Trae2api-dsh is an independent community integration. DeepSeek, TRAE and their affiliates do not provide, authorize, endorse or warrant this project. Product names and trademarks identify compatibility only and belong to their respective owners. Submission, listing or an installation check is not platform authorization, legal review or a security audit.
 
 ## Source licensing and service authorization
 
@@ -33,4 +33,4 @@ Software is provided as is under MIT. To the extent allowed by applicable law, a
 
 This notice discloses usage boundaries. It is not legal advice, evidence of platform permission or guaranteed immunity. A disclaimer cannot legalize unlawful conduct, contract breaches or infringement, or guarantee the elimination of legal risk.
 
-Report potential infringement, misleading claims or security concerns through the [project issue tracker](https://github.com/FuSheng-cs/dsh-trae-relay/issues) without sensitive details. Do not post credentials, personal data or directly exploitable attack details in public issues.
+Report potential infringement, misleading claims or security concerns through the [project issue tracker](https://github.com/FuSheng-cs/Trae2api-dsh/issues) without sensitive details. Do not post credentials, personal data or directly exploitable attack details in public issues.
