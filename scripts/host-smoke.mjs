@@ -147,6 +147,73 @@ try {
     discovered.models.find((m) => m.id === "example-plain").reasoningLevels,
     [],
   );
+  const consoleEntry = await call("console");
+  const relayOrigin = new URL(consoleEntry).origin;
+  assert.equal(
+    (
+      await fetch(relayOrigin + "/dsh/controls/models", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      })
+    ).status,
+    401,
+  );
+  const admission = await fetch(relayOrigin + "/dsh/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ticket: new URL(consoleEntry).hash.slice(1) }),
+  });
+  assert.equal(admission.status, 200);
+  const consoleCookie = admission.headers.get("set-cookie").split(";")[0];
+  const html = await (
+    await fetch(relayOrigin + "/web/login", {
+      headers: { Cookie: consoleCookie },
+    })
+  ).text();
+  for (const name of [
+    "概览",
+    "账号与签到",
+    "消费记录",
+    "轮询与设置",
+    "模型测试",
+    "DSH 模型管理",
+  ])
+    assert.ok(html.includes(name));
+  const consoleCall = async (action, payload = {}) => {
+    const response = await fetch(relayOrigin + "/dsh/controls/" + action, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Cookie: consoleCookie,
+        Origin: relayOrigin,
+      },
+      body: JSON.stringify(payload),
+    });
+    assert.equal(response.status, 200);
+    const result = await response.json();
+    assert.equal(result.ok, true, result.error);
+    return result.value;
+  };
+  assert.equal((await consoleCall("models")).models.length, 3);
+  await consoleCall("modelVisibility", {
+    changes: [{ id: "example-reasoner", visible: false }],
+  });
+  assert.equal(
+    (await call("models")).models.find((m) => m.id === "example-reasoner")
+      .visible,
+    false,
+  );
+  const csrf = await fetch(relayOrigin + "/dsh/controls/modelVisibility", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Cookie: consoleCookie,
+      Origin: "http://attacker.test",
+    },
+    body: "{}",
+  });
+  assert.equal(csrf.status, 403);
   assert.ok((await readFile(patch, "utf8")).includes("example-plain"));
   await call("modelVisibility", {
     changes: [{ id: "example-reasoner", visible: false }],

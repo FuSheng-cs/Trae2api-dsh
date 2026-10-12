@@ -15,8 +15,13 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from src import auth, trae_decrypt
 from src.main import app, PUBLIC_PATHS
 from model_catalog import discover_models, restore_config_aliases
+from console_models import control, extend_console, ALLOWED
+from src import main as relay_main
 
 restore_config_aliases(ENGINE.parent / 'config.json')
+original_console_html=relay_main._web_login_html
+relay_main._web_login_html=lambda:extend_console(original_console_html())
+PUBLIC_PATHS.update('/dsh/controls/'+action for action in ALLOWED)
 
 PUBLIC_PATHS.update(('/dsh/console', '/dsh/session'))
 
@@ -79,6 +84,21 @@ async def account_models():
         return JSONResponse({'models': await discover_models()}, headers={'Cache-Control': 'no-store'})
     except ValueError as error:
         return JSONResponse({'error': str(error)}, status_code=400)
+
+
+@app.post('/dsh/controls/{action}')
+async def console_control(action: str, request: Request):
+    if action not in ALLOWED:
+        return JSONResponse({'error':'Unknown action'},status_code=404)
+    text=await request.body()
+    if len(text)>262144:
+        return JSONResponse({'error':'Request too large'},status_code=413)
+    try:
+        payload=json.loads(text or b'{}')
+    except ValueError:
+        return JSONResponse({'error':'Invalid JSON'},status_code=400)
+    result=await control(action,payload)
+    return JSONResponse(result,status_code=200 if result.get('ok') else 400,headers={'Cache-Control':'no-store'})
 
 
 @app.get('/dsh/console')

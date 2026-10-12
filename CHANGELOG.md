@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.0
+
+- Restore the original full embedded TRAE console as the default sidebar view, including overview, accounts/check-in, usage, relay settings and model tests.
+- Add model discovery, strengths and show/hide controls inside that console's new DSH model-management tab. All visible models remain in the native composer model picker.
+- Keep environment preparation and service controls in a separate settings view; switching views keeps the original console iframe alive.
+- A private authenticated relay-to-Host bridge synchronizes console changes through DSH's Settings API, including when the console opens in a separate browser window.
+- Test original console preservation, bridge authentication, console-to-picker updates and cross-origin write rejection.
+
 ## 1.1.0
 
 - Discover the active account's real Remote/SOLO model configs, display names, context limits, image capability and supported reasoning levels.

@@ -3,11 +3,13 @@
 [中文](README.md)
 
 A community DeepSeek Harness plugin providing a managed local TRAE CN relay,
-native account controls and a link to the upstream management console.
+the original full embedded management console, and model controls inside it.
 The relay engine is [autumnsentiment/Trae2api-cn](https://github.com/autumnsentiment/Trae2api-cn),
 pinned to v1.0.4; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). This is not an official DeepSeek/TRAE product.
 
 ![TRAE model and effort menu in an isolated DSH profile](assets/model-selection.png)
+
+![The original full embedded console, using an isolated test account](assets/embedded-console.png)
 
 ![Model catalog and visibility controls using isolated test fixtures; actual models come from your account](assets/model-catalog.png)
 
@@ -24,13 +26,13 @@ dsh web
 ```
 
 Desktop users add the same archive through the native plugin manager, or use
-the marketplace once the entry is accepted. Enable the plugin and open **TRAE 反代** in the sidebar.
+the marketplace once the entry is accepted. Enable the plugin and open **TRAE 控制台** in the sidebar.
 
 1. Prepare the private Python environment. Optionally supply a Python executable and an unused port.
 2. Start the service.
 3. Explicitly import your logged-in SOLO CN or CN desktop account. Only that click reads desktop storage; the source file is never modified.
-4. Connect the model route and select **TRAE CN / DeepSeek V4.1 Flash (TRAE)** in the model picker. Low, High and Xhigh map to light, high and extra_high; High is the initial route default.
-5. Open the full console for advanced account/usage/settings controls. Allow popups. Its one-use entry expires after 30 seconds and does not contain the relay API key.
+4. Return to the embedded console. Its original overview, accounts/check-in, usage, relay settings and model tests remain available. Connect models in the new **DSH 模型管理** tab.
+5. Select any visible TRAE model in the native composer picker and choose its advertised reasoning strength. Show/hide controls stay inside the console. Its header provides refresh, open in new window, and a separate service-settings view. Switching settings keeps the iframe alive.
 
 ## Discover and show/hide models
 
@@ -38,7 +40,7 @@ Desktop import, account switching and model connection automatically read the
 catalog once. Catalog failure does not undo a successful sign-in; it reports a
 warning and retains the previous list.
 
-After signing in, click **发现 / 刷新可用模型** in **模型与思考强度**. The active account's Remote/SOLO configs supply genuine model IDs, display names, context limits, image support and reasoning options. Only advertised supported strengths are offered: light → Low, high → High, extra_high → Xhigh. Models without advertised controls use the upstream default. Discovery makes catalog requests, not billable inference probes; model access still depends on account entitlement, quota and upstream availability.
+After signing in, click **发现 / 刷新可用模型** inside the original console's **DSH 模型管理** tab. The active account's Remote/SOLO configs supply genuine model IDs, display names, context limits, image support and reasoning options. Only advertised supported strengths are offered: light → Low, high → High, extra_high → Xhigh. Models without advertised controls use the upstream default. Discovery makes catalog requests, not billable inference probes; model access still depends on account entitlement, quota and upstream availability.
 
 Search by name/ID and use **显示到 dsh** to show/hide models individually, or use the bulk controls. Connected routes synchronize immediately through DSH's Settings API. Hiding removes a model from DSH's configured catalog; sessions still using it must switch models. Hiding all removes this plugin's provider temporarily, and showing any model restores it. Other providers and saved defaults are preserved.
 
@@ -74,6 +76,12 @@ adds the plugin's own `DSH_TRAE_RELAY_API_KEY` credential and writes only its
 API. Other providers and model defaults are preserved. Disconnecting removes
 only that owned provider and keeps credentials/data. Startup/exit does not
 rewrite model settings; disconnect before disabling or uninstalling.
+
+Console model controls use a private authenticated relay-to-Host bridge. Its
+secret stays in child-process memory, never in browser source, console URLs or
+account/configuration files. The authorized console session can manage only
+the plugin's model actions; cross-origin writes are refused. The same controls
+work from the embedded console and its separate browser window.
 
 Uninstall does not erase account data. Exit dsh before manually deleting the
 plugin state and removing its credential reference. An occupied port is refused;

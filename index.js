@@ -1,5 +1,6 @@
 import { RelayRuntime, PROVIDER, MODEL } from "./lib/runtime.js";
 import { visibleModelConfig, withVisibility } from "./lib/models.js";
+import { createConsoleBridge } from "./lib/console-bridge.js";
 
 export const name = "trae-relay";
 export const inject = [
@@ -220,6 +221,9 @@ export async function apply(ctx) {
         }),
       ),
   };
+  const bridge = await createConsoleBridge(actions);
+  runtime.consoleBridge = bridge;
+  ctx.effect(() => () => bridge.dispose());
   // Exact Fetch contributions share DSH's existing authentication fence.
   // Avoid separate RPC channels: their 0.2.0 Host registration has stricter
   // service-scope requirements and is unnecessary for unary controls.
