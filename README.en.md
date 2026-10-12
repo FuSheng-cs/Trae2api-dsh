@@ -1,12 +1,14 @@
 # dsh-trae-relay
 
-[中文](README.md)
+[中文](README.md) · [Usage boundaries and disclaimer](DISCLAIMER.en.md)
 
 A community DeepSeek Harness plugin bringing **TRAE CN daily check-in,
 multi-account management and account rotation** into dsh, with account-provided
 models and reasoning strengths in the native composer picker.
 The relay engine is [autumnsentiment/Trae2api-cn](https://github.com/autumnsentiment/Trae2api-cn),
 pinned to v1.0.4; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). This is not an official DeepSeek/TRAE product.
+
+> Read the [usage boundaries and disclaimer](DISCLAIMER.en.md) before use. Use authorized accounts and confirm provider permission for the interface and automation. MIT source licensing is not third-party service authorization; upstream also displays a learning-only, non-commercial-use notice. No quota, suspension protection or immunity from legal risk is promised.
 
 ## Core features
 

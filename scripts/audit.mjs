@@ -12,6 +12,8 @@ const roots = [
   "README.en.md",
   "LICENSE",
   "THIRD_PARTY_NOTICES.md",
+  "DISCLAIMER.md",
+  "DISCLAIMER.en.md",
 ];
 async function walk(path) {
   let files;

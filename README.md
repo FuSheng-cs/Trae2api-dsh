@@ -1,10 +1,12 @@
 # dsh-trae-relay
 
-[English](README.en.md) · [下载](https://github.com/FuSheng-cs/dsh-trae-relay/releases) · [反馈](https://github.com/FuSheng-cs/dsh-trae-relay/issues)
+[English](README.en.md) · [下载](https://github.com/FuSheng-cs/dsh-trae-relay/releases) · [使用边界与免责声明](DISCLAIMER.md) · [反馈](https://github.com/FuSheng-cs/dsh-trae-relay/issues)
 
 把 **TRAE CN 的自动签到、多账号管理和账号轮询** 集成到 **DeepSeek Harness（dsh）**，在原生模型菜单中使用账号提供的模型与思考档位。
 这是社区插件，独立于 DeepSeek 和 TRAE 官方。反代引擎来自
 [autumnsentiment/Trae2api-cn](https://github.com/autumnsentiment/Trae2api-cn)，完整署名见 [第三方说明](THIRD_PARTY_NOTICES.md)。
+
+> 使用前请阅读 [使用边界与免责声明](DISCLAIMER.md)：仅使用有权使用的账号，并确认服务方允许相应接口和自动化。源码 MIT 许可不代表第三方服务授权；上游另有学习用途及非商业用途提示。本插件不提供额度、不承诺防封号或消除法律风险。
 
 ## 核心功能
 

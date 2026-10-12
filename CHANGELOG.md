@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.1
+
+- Include Chinese and English usage boundaries and disclaimers in the prebuilt package, with prominent README links.
+- Preserve and attribute upstream learning/non-commercial-use notices separately from the unchanged MIT licenses; distinguish source licensing from third-party service authorization.
+- Document account authorization, automation defaults, credential/data handling, provider restrictions and applicable-law limits without promising legal immunity or account safety.
+- Keep the complete embedded console, native model/effort picker, visibility controls and all existing runtime behavior from 1.2.0.
+
 ## 1.2.0
 
 - Restore the original full embedded TRAE console as the default sidebar view, including overview, accounts/check-in, usage, relay settings and model tests.
