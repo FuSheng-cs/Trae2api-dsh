@@ -8,6 +8,8 @@
 
 ![dsh 中的 TRAE V4.1 Flash 和思考强度菜单](assets/model-selection.png)
 
+![模型发现、思考档位和显示控制（隔离测试示例，实际列表由账号返回）](assets/model-catalog.png)
+
 ## 功能
 
 - dsh 原生侧栏管理页：准备环境、启动/停止、导入当前桌面账号、切换优先账号、启用/禁用模型调用。

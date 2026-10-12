@@ -9,6 +9,8 @@ pinned to v1.0.4; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). This is 
 
 ![TRAE model and effort menu in an isolated DSH profile](assets/model-selection.png)
 
+![Model catalog and visibility controls using isolated test fixtures; actual models come from your account](assets/model-catalog.png)
+
 ## Install and use
 
 Requires local dsh 0.2.0-rc.2, Node 22+, Python 3.10+ with venv/pip, and an
