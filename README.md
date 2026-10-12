@@ -1,129 +1,107 @@
-# dsh-trae-relay
+# TRAE Relay for DSH
 
-[English](README.en.md) · [下载](https://github.com/FuSheng-cs/dsh-trae-relay/releases) · [使用边界与免责声明](DISCLAIMER.md) · [反馈](https://github.com/FuSheng-cs/dsh-trae-relay/issues)
+[![Release](https://img.shields.io/github/v/release/FuSheng-cs/dsh-trae-relay?label=release)](https://github.com/FuSheng-cs/dsh-trae-relay/releases/latest)
+[![CI](https://github.com/FuSheng-cs/dsh-trae-relay/actions/workflows/ci.yml/badge.svg)](https://github.com/FuSheng-cs/dsh-trae-relay/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-把 **TRAE CN 的自动签到、多账号管理和账号轮询** 集成到 **DeepSeek Harness（dsh）**，在原生模型菜单中使用账号提供的模型与思考档位。
-这是社区插件，独立于 DeepSeek 和 TRAE 官方。反代引擎来自
-[autumnsentiment/Trae2api-cn](https://github.com/autumnsentiment/Trae2api-cn)，完整署名见 [第三方说明](THIRD_PARTY_NOTICES.md)。
+在 **DeepSeek Harness** 中使用 TRAE CN 模型，集中管理账号、签到、轮询与用量。
 
-> 使用前请阅读 [使用边界与免责声明](DISCLAIMER.md)：仅使用有权使用的账号，并确认服务方允许相应接口和自动化。源码 MIT 许可不代表第三方服务授权；上游另有学习用途及非商业用途提示。本插件不提供额度、不承诺防封号或消除法律风险。
+[English](README.en.md) · [下载](https://github.com/FuSheng-cs/dsh-trae-relay/releases/latest) · [使用指南](docs/usage.zh-CN.md) · [问题反馈](https://github.com/FuSheng-cs/dsh-trae-relay/issues)
 
-## 核心功能
+## 功能
 
-| 功能 | 能做什么 | 控制台入口 |
-| --- | --- | --- |
-| **自动签到** | 按设定的北京时间，每天依次为已保存账号签到；跳过当天已签到账号，支持立即执行和查看执行结果。 | 账号与签到 → 自动签到 |
-| **多账号管理** | 导入桌面账号或网页授权登录，保存多个账号、切换当前账号，并独立启用/禁用各账号的模型调用。 | 账号与签到 |
-| **账号轮询** | 在有效且启用模型调用的账号之间切换；支持顺序轮询与按剩余积分排序的积分优先模式。 | 轮询与设置 → 多账号轮询 |
-| **积分与用量概览** | 查询账号积分与签到状态，查看 Token、缓存、请求和消费记录，按日期汇总用量。 | 概览 / 账号与签到 / 消费记录 |
-| **模型与思考强度** | 自动发现账号提供的可选模型，把实际支持的 Low / High / Xhigh 档位配置到 dsh 原生模型菜单。 | DSH 模型管理 / 对话输入框 |
-| **模型显示管理** | 搜索、逐个显示/隐藏或批量切换模型；显示偏好在刷新和重启后保留，并同步到 dsh 模型菜单。 | DSH 模型管理 |
-| **完整内嵌控制台** | 在 dsh 内继续使用原有概览、账号与签到、消费记录、轮询与设置及模型测试页面，也可新窗口打开。 | dsh 侧栏 → TRAE 控制台 |
+| 功能 | 说明 |
+| --- | --- |
+| **自动签到** | 按北京时间每日签到，跳过当天已签到账号；支持立即执行和查看结果。 |
+| **多账号管理** | 导入桌面账号或网页授权登录，切换当前账号，分别启用或禁用模型调用。 |
+| **账号轮询** | 在有效账号之间顺序轮询，或按缓存的剩余积分排序调度。 |
+| **模型与思考强度** | 发现账号的 Remote / SOLO 模型，接入 dsh 原生模型菜单，提供实际支持的 Low / High / Xhigh 档位。 |
+| **模型显示管理** | 在控制台搜索、显示或隐藏模型，支持批量操作，刷新与重启后保留偏好。 |
+| **用量统计** | 查看账号积分、Token、缓存、请求与消费记录，以及每日用量。 |
+| **内嵌控制台** | 保留完整 TRAE 控制台，也可在浏览器新窗口打开；代理随 dsh 启动，完整退出时停止。 |
 
-自动签到与账号轮询默认关闭，按需在控制台开启并保存。自动签到只在代理服务运行时执行；完整退出 dsh 后，代理与签到任务一起停止。
+自动签到和轮询默认关闭，可在控制台按需开启。关闭窗口到托盘时服务继续运行。
 
-## 集成与运行
+## 界面预览
 
-- 独立的 **服务设置** 入口负责准备环境、启动/停止和只读导入当前桌面账号，切换设置时保留内嵌控制台。
-- 首次准备后随 dsh 启动；完整退出、Host 结束或禁用插件时停止整个服务进程树。关闭桌面窗口到托盘时继续运行。
-- 独立 Python 虚拟环境，自动分配并保存回环端口；可指定 Python 路径和端口。
-- 预置 **DeepSeek V4.1 Flash**，登录后读取 Remote / SOLO 模型目录，接入账号实际提供的模型与思考档位。
-- 保留已有模型默认值、其他供应商配置、TRAE 客户端文件和既有反代服务。首次启动不会自动读取或导入任何账号。
-- 不需要 Docker；安装包带可执行的前后端文件和固定版本上游源代码，没有安装时构建脚本。
+![TRAE 控制台：账号、签到与用量管理](assets/embedded-console.png)
 
-## 界面展示
+<details>
+<summary>查看模型管理与思考强度菜单</summary>
 
-![保留原有完整内嵌控制台（隔离测试示例）](assets/embedded-console.png)
+![模型发现与显示设置](assets/model-catalog.png)
 
-![模型发现、思考档位和显示控制（隔离测试示例，实际列表由账号返回）](assets/model-catalog.png)
+![dsh 原生模型与思考强度菜单](assets/model-selection.png)
 
-![dsh 中的 TRAE V4.1 Flash 和思考强度菜单](assets/model-selection.png)
+</details>
 
-## 运行要求
+截图使用隔离测试数据；实际模型列表由账号返回。
 
-- 本机 dsh **0.2.0-rc.2**，Node.js **22+**。未来 dsh 版本以 CI/兼容验证为准。
-- 本机 Web/CLI 的插件安装命令需要可用的 `pnpm`（10+）；Desktop 使用其自带的插件管理运行环境。
-- Python **3.10+**，包含 `venv` / `pip`。准备环境需要连接 Python 包镜像。
-- 已登录、具有目标模型使用权限的 **Trae CN / TRAE SOLO CN** 账号。
-- Windows 10/11；Linux/macOS 提供同一安装流程与生命周期实现，实际支持范围以 CI 为准。
-- 此版面向本机 Desktop / Web；不支持在远程浏览器打开 Host 回环地址的完整控制台。中国版协议，不承诺国际版兼容。
+## 快速开始
 
-模型名称与额度由 TRAE 决定；账号没有 V4.1 Flash 权限时会返回上游错误，插件不会把请求悄悄改成其他模型。
-请遵守服务方条款，只使用自己有权使用的账号。插件不提供额度、不绕过订阅，也不承诺封号保护。
+### 环境要求
 
-## 安装
+| 环境 | 要求 |
+| --- | --- |
+| dsh | 已验证 **0.2.0-rc.2**，本机 Desktop / Web |
+| Node.js | **22+** |
+| Python | **3.10+**，包含 `venv` 和 `pip` |
+| 账号 | TRAE CN / TRAE SOLO CN，具有目标模型使用权限 |
+| 操作系统 | Windows 10/11；Linux、macOS 通过 CI 验证 |
 
-### Desktop
+本机 Web / CLI 安装需要 `pnpm` 10+；Desktop 使用自带的插件管理环境。首次准备需要联网下载 Python 依赖，无需 Docker。
 
-打开 dsh **设置 → 插件**，通过插件市场的安装入口或管理器的添加包入口安装以下预构建包：
+### 安装
+
+**Desktop**：在 dsh 插件管理器中添加以下预构建包，启用后打开侧栏 **TRAE 控制台**。
 
 ```text
 https://github.com/FuSheng-cs/dsh-trae-relay/releases/latest/download/dsh-trae-relay.tgz
 ```
 
-如果所用市场尚未收录本仓库，请在原生插件管理器添加上述包；不同市场可能拒绝未收录来源。
-无需执行 `postinstall` / `prepare`。安装后启用插件，侧栏出现 **TRAE 控制台**。
-
-### 本机 Web / CLI
+**本机 Web / CLI**：
 
 ```sh
 dsh plugin --profile web add https://github.com/FuSheng-cs/dsh-trae-relay/releases/latest/download/dsh-trae-relay.tgz
 dsh web
 ```
 
-### 首次使用
+Release 同时提供 `SHA256SUMS.txt` 校验文件。[各插件市场收录状态](MARKETPLACES.md)单独记录，未收录的市场可能限制安装来源。
 
-1. 首次打开 **TRAE 控制台** 会显示服务设置，点 **准备环境**。找不到 Python 时填写可执行文件完整路径；端口留空自动选择。首次下载可能需要几分钟。
-2. 点 **启动服务**。
-3. 选择实际登录的 **TRAE SOLO CN** 或 **Trae CN**，点 **导入当前桌面账号**。非标准安装可填写 `User` 数据目录（其下有 `globalStorage/storage.json`）。导入仅在点击时发生，源文件保持只读。
-4. 点 **返回控制台**，原有控制台的概览、账号、消费、轮询与模型测试页面均保留。在其中的 **DSH 模型管理** 点 **接入 dsh 模型菜单**。
-5. 在对话输入框原生模型菜单选择 TRAE CN 下任一显示的模型，并选择它支持的思考强度。管理显示/隐藏仍在控制台中完成。顶部 **刷新控制台** 重新加载内嵌页面，**新窗口打开** 可在浏览器使用同一完整控制台。
+### 首次配置
 
-网页授权助手从已授权的控制台下载，自动指向本实例，仅携带 15 分钟有效的一次账号提交授权；过期后重新下载。Windows 的 `start_auth.bat` 需与下载的 `web_login.py` 放在同一目录。使用助手会在本机启动上游的 OAuth 回调监听器；桌面导入不需要助手。
+1. 打开 **TRAE 控制台 → 服务设置**，点击 **准备环境**，完成后点击 **启动服务**。
+2. 选择 **TRAE SOLO CN** 或 **Trae CN**，点击 **导入当前桌面账号**；也可返回控制台进行网页授权登录。
+3. 在控制台的 **DSH 模型管理** 中点击 **接入 dsh 模型菜单**。
+4. 在对话输入框选择模型和思考强度；显示或隐藏模型仍在控制台中设置。
 
-导入新账号会将其选为当前账号；禁用旧账号可阻止其参与模型请求。已有账号额度轮询等高级策略由完整控制台的设置决定。
+首次启动不会自动导入账号。导入由你主动触发，TRAE 客户端登录文件保持只读。
 
-### 开启签到与账号轮询
+## 使用入口
 
-1. **多账号**：在 **账号与签到** 添加账号，按需切换当前账号或保存各账号的模型开关。模型调用开关与签到管理分开，禁用模型调用不会删除账号。
-2. **自动签到**：在同页的 **自动签到** 开启定时签到、设置北京时间并点 **保存**；可用 **立即执行** 手动签到，查看上次执行、下次执行和结果。
-3. **账号轮询**：在 **轮询与设置 → 多账号轮询** 开启轮询，选择 **顺序轮询** 或 **积分优先**，再点 **保存轮询设置**。积分优先使用已缓存的剩余积分排序，可先在账号页刷新积分。
+| 要做什么 | 去哪里 |
+| --- | --- |
+| 添加账号、切换账号、设置自动签到 | **账号与签到** |
+| 开启顺序轮询或积分优先模式 | **轮询与设置 → 多账号轮询** |
+| 刷新模型目录、显示或隐藏模型 | **DSH 模型管理** |
+| 查看积分、Token 与消费记录 | **概览 / 消费记录** |
+| 准备环境、启动或停止代理 | 顶部 **服务设置** |
 
-### 更多模型和显示设置
+详细操作、账号策略、模型行为和故障排查见 [使用指南](docs/usage.zh-CN.md)。
 
-导入、切换账号或接入模型时会自动读取一次模型目录；成功登录不会因为目录读取失败而撤销，读取失败时会提示并保留旧列表。
+## 常见问题
 
-登录后在原有控制台的 **DSH 模型管理** 点 **发现 / 刷新可用模型**。插件读取当前账号返回的真实模型配置，并逐个显示可选思考档位：`light → Low`、`high → High`、`extra_high → Xhigh`。例如上游只给 Low/High 的模型不会出现 Xhigh；没有公布思考档位的模型使用上游默认行为。目录读取不发送推理请求，不做逐模型扣费测试；实际调用仍受账号权限、额度和上游可用性限制。
+**关闭 dsh 窗口会停止代理吗？** 关闭到托盘时继续运行；完整退出 dsh、Host 结束或禁用插件时停止代理和签到任务。
 
-勾选 **显示到 dsh** 可接入或隐藏单个模型；也可搜索、显示全部或隐藏全部。已接入时立即通过 dsh 官方 Settings API 同步。隐藏会从 dsh 提供的模型目录中移除模型，仍使用它的会话需要先切换模型。隐藏全部会暂时移除本插件的供应商目录，重新显示任一模型可恢复。其他供应商和已保存默认值保持原样。
+**为什么模型列表或思考档位不同？** 插件读取当前账号返回的目录。未提供的档位不会显示，没有公布思考档位的模型使用上游默认行为。切换账号后可以刷新目录。
 
-显示偏好与最新成功读取的目录会持久保存，刷新失败不清空旧列表；上游暂时未返回的模型，其隐藏偏好仍保留。切换账号后请重新刷新目录。V4.1 Flash 在该账号目录存在时优先排列；混合非思考模型或档位不兼容时不强加统一 High 默认值，各模型使用其上游默认，用户可以在对话菜单选择实际支持的档位。
+**隐藏模型会影响已有会话吗？** 隐藏会从 dsh 模型目录移除该模型，请先切换仍在使用它的会话。重新显示后可恢复，其他供应商和已保存默认值保留。
 
-## 数据与权限
+**支持国际版或远程浏览器吗？** 当前支持中国版协议和本机 Desktop / Web；完整控制台使用 Host 回环地址，远程浏览器场景尚未支持。
 
-默认目录：`$DSH_HOME/plugins/dsh-trae-relay`；未设置 DSH_HOME 时在用户主目录 `.dsh/plugins/dsh-trae-relay`。
-用 `DSH_TRAE_RELAY_HOME` 为不同 dsh 实例指定不同目录。不要让两个 Host 共享一个插件运行目录。
+## 开发与贡献
 
-- `config.json`：端口、插件 API key、是否接入模型。
-- `venv/`：独立 Python 环境。
-- `engine/data/accounts.json`、`engine/.env`：代理自己的账号副本与设置。
-- `relay.log`：本地错误日志。日志和账号文件不属于发布包，请勿上传。
-
-Windows 初始化移除数据目录继承权限，仅授予当前用户与 SYSTEM；POSIX 私有目录/配置使用 0700/0600。
-代理仅监听 `127.0.0.1`，模型请求需要 API key。控制台使用一次性入口交换 HttpOnly 会话，拒绝跨站写请求与非回环 Host；API key 不放在控制台地址中。
-
-**接入模型**创建插件自己的 `DSH_TRAE_RELAY_API_KEY` credential 引用，并通过 dsh 官方 Settings API 只写入 `llm-pi-ai.providers.trae-relay`。使用配置 revision 防止覆盖并发编辑，保留其他供应商和全局默认模型。断开仅删除这个归属本插件的供应商字段，保留账号与 credential 便于再次接入。启动/退出不会重写模型配置；禁用或卸载前请先断开，避免留下指向已停止服务的供应商。
-
-## 卸载与恢复
-
-先停止服务/断开模型，再在插件管理器卸载。本插件不自动删除账号文件，避免卸载造成数据丢失。
-要彻底清理，完整退出 dsh 后手动删除上述插件数据目录，并在 dsh credential 管理中移除 `DSH_TRAE_RELAY_API_KEY`。
-重新安装可沿用插件数据；插件更新会刷新自己的 Python runner 文件，保留虚拟环境、账号和显示偏好。上游依赖/环境版本变化需要点 **重新准备环境**，准备前先停止服务并断开模型。准备时保留账号和设置。
-
-端口冲突会明确报错，不接管其他正在运行的反代；停止本插件后指定空闲端口并重新准备即可。
-Python 下载失败可调整你自己的 pip 镜像或网络后重试。插件不更改系统代理、系统 Python 或全局 Git 设置。
-
-## 开发与验证
+欢迎通过 [Issues](https://github.com/FuSheng-cs/dsh-trae-relay/issues) 报告问题，或提交改进。
 
 ```sh
 npm test
@@ -131,14 +109,10 @@ npm run check
 npm pack
 ```
 
-集成测试需先在**测试专用目录**初始化 RelayRuntime，再设置 `DSH_RELAY_TEST_HOME` 指向它。
-它使用合成账号 fixture，不会读取真实 TRAE 登录信息，也不调用付费模型。
-覆盖实际 Python 进程启动/停止、Host 强制退出后的回收、授权/跨站防护、一次性票据、只读账号导入与禁用，以及带模拟上游目录的真实 dsh 模型发现、思考元数据、显示/隐藏、隐藏全部后的恢复和其他供应商配置保留。测试专用上游模拟只修改经过目录检查的 `work/` 中的引擎副本，不进入发布包。
-`tests/engine` 是上游署名测试，覆盖 SSE、工具协议和 reasoning 映射；设置 `PYTHONPATH=vendor/trae2api-cn` 后用 Python unittest 运行。
+[贡献指南](CONTRIBUTING.md)包含目录结构、隔离测试方法和打包流程。CI 在 Windows、Ubuntu、macOS 上验证插件、真实 dsh 安装、模型同步与服务生命周期。
 
-GitHub Actions 在 Windows / Ubuntu / macOS 上验证插件测试、relay 集成和打包审计。GitHub Release 发布预构建 `.tgz` 与 SHA-256 校验文件。
-测试不验证每个 TRAE 账号的在线额度或上游持续可用性。
+## 致谢与许可
 
-## 许可
+反代引擎与原有管理界面来自 [autumnsentiment/Trae2api-cn](https://github.com/autumnsentiment/Trae2api-cn)，固定为 v1.0.4。项目采用 [MIT 许可](LICENSE)，保留上游版权与许可证；来源及上游用途提示见 [第三方说明](THIRD_PARTY_NOTICES.md)。
 
-插件为 MIT；内置引擎保留上游 MIT 许可和版权声明。见 [LICENSE](LICENSE) 与 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+独立社区项目。账号、接口和自动化的适用范围见 [使用边界与免责声明](DISCLAIMER.md)。

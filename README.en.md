@@ -1,122 +1,107 @@
-# dsh-trae-relay
+# TRAE Relay for DSH
 
-[中文](README.md) · [Usage boundaries and disclaimer](DISCLAIMER.en.md)
+[![Release](https://img.shields.io/github/v/release/FuSheng-cs/dsh-trae-relay?label=release)](https://github.com/FuSheng-cs/dsh-trae-relay/releases/latest)
+[![CI](https://github.com/FuSheng-cs/dsh-trae-relay/actions/workflows/ci.yml/badge.svg)](https://github.com/FuSheng-cs/dsh-trae-relay/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A community DeepSeek Harness plugin bringing **TRAE CN daily check-in,
-multi-account management and account rotation** into dsh, with account-provided
-models and reasoning strengths in the native composer picker.
-The relay engine is [autumnsentiment/Trae2api-cn](https://github.com/autumnsentiment/Trae2api-cn),
-pinned to v1.0.4; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). This is not an official DeepSeek/TRAE product.
+Use TRAE CN models in **DeepSeek Harness**, with accounts, daily check-in, rotation and usage in one console.
 
-> Read the [usage boundaries and disclaimer](DISCLAIMER.en.md) before use. Use authorized accounts and confirm provider permission for the interface and automation. MIT source licensing is not third-party service authorization; upstream also displays a learning-only, non-commercial-use notice. No quota, suspension protection or immunity from legal risk is promised.
+[中文](README.md) · [Download](https://github.com/FuSheng-cs/dsh-trae-relay/releases/latest) · [User guide](docs/usage.en.md) · [Report an issue](https://github.com/FuSheng-cs/dsh-trae-relay/issues)
 
-## Core features
+## Features
 
-| Feature | What it provides | Console entry |
-| --- | --- | --- |
-| **Automatic daily check-in** | Sign in stored accounts sequentially at a configured Beijing-time schedule, skip accounts already checked in today, run immediately and inspect results. | 账号与签到 → 自动签到 |
-| **Multiple accounts** | Import desktop credentials or use web authorization, keep multiple accounts, switch the active account, and enable/disable model requests per account. | 账号与签到 |
-| **Account rotation** | Rotate among valid accounts enabled for model requests, using round-robin or an order based on cached remaining credits. | 轮询与设置 → 多账号轮询 |
-| **Credits and usage** | Query account credits/check-in status and inspect tokens, cache, requests and consumption records with daily summaries. | 概览 / 账号与签到 / 消费记录 |
-| **Models and reasoning** | Discover the account's models and configure their advertised Low/High/Xhigh strengths in dsh's native model picker. | DSH 模型管理 / composer |
-| **Model visibility** | Search, show/hide individual models or use bulk controls; retain preferences across refresh/restart and synchronize the dsh picker. | DSH 模型管理 |
-| **Full embedded console** | Keep the original overview, accounts/check-in, usage, relay settings and model tests inside dsh, with a separate-window option. | TRAE 控制台 sidebar |
+| Feature | Description |
+| --- | --- |
+| **Automatic check-in** | Run daily on a Beijing-time schedule, skip accounts already checked in, run immediately and inspect results. |
+| **Multiple accounts** | Import a desktop account or authorize through the web, switch the active account and enable or disable requests per account. |
+| **Account rotation** | Rotate among eligible accounts, in round-robin order or an order based on cached remaining credits. |
+| **Models and reasoning** | Discover account-provided Remote / SOLO models and their supported Low / High / Xhigh strengths in the native dsh picker. |
+| **Model visibility** | Search, show or hide models in the console, use bulk controls and retain preferences across refreshes and restarts. |
+| **Usage statistics** | Inspect credits, tokens, cache, requests, consumption records and daily totals. |
+| **Embedded console** | Keep the complete TRAE console or open it in a separate window. The relay starts with dsh and stops on full exit. |
 
-Automatic check-in and rotation start disabled. Enable and save them in the
-console when needed. Check-in runs only while the relay is running; a complete
-dsh exit stops both the relay and its scheduled work. No Docker is required,
-and the private Python environment prepares without changing system Python.
+Check-in and rotation are disabled by default. Enable them in the console when needed. Closing the Desktop window to its tray keeps the service running.
 
-## Screenshots
+## Preview
 
-![The original full embedded console, using an isolated test account](assets/embedded-console.png)
+![TRAE console: accounts, daily check-in and usage](assets/embedded-console.png)
 
-![Model catalog and visibility controls using isolated test fixtures; actual models come from your account](assets/model-catalog.png)
+<details>
+<summary>View model management and reasoning selection</summary>
 
-![TRAE model and effort menu in an isolated DSH profile](assets/model-selection.png)
+![Model discovery and visibility controls](assets/model-catalog.png)
 
-## Install and use
+![Native dsh model and reasoning picker](assets/model-selection.png)
 
-Requires local dsh 0.2.0-rc.2, Node 22+, Python 3.10+ with venv/pip, and an
-authorized TRAE CN or SOLO CN account with access to the selected model.
-Local Web/CLI plugin installation also requires `pnpm` 10+ on PATH; Desktop
-uses its bundled plugin-management runtime.
+</details>
+
+Screenshots use isolated test data. Your account supplies the actual model catalog.
+
+## Quick start
+
+### Requirements
+
+| Environment | Requirement |
+| --- | --- |
+| dsh | Tested **0.2.0-rc.2**, local Desktop / Web |
+| Node.js | **22+** |
+| Python | **3.10+**, with `venv` and `pip` |
+| Account | TRAE CN / TRAE SOLO CN, with access to the selected model |
+| Operating system | Windows 10/11; Linux and macOS covered by CI |
+
+Local Web / CLI installation requires `pnpm` 10+. Desktop uses its bundled plugin manager. Initial setup downloads Python dependencies; Docker is not required.
+
+### Install
+
+**Desktop**: add this prebuilt archive in the dsh plugin manager, enable the plugin and open **TRAE 控制台** in the sidebar.
+
+```text
+https://github.com/FuSheng-cs/dsh-trae-relay/releases/latest/download/dsh-trae-relay.tgz
+```
+
+**Local Web / CLI**:
 
 ```sh
 dsh plugin --profile web add https://github.com/FuSheng-cs/dsh-trae-relay/releases/latest/download/dsh-trae-relay.tgz
 dsh web
 ```
 
-Desktop users add the same archive through the native plugin manager, or use
-the marketplace once the entry is accepted. Enable the plugin and open **TRAE 控制台** in the sidebar.
+Releases include `SHA256SUMS.txt`. [Marketplace status](MARKETPLACES.md) is tracked separately; some markets restrict sources that have not been listed.
 
-1. Prepare the private Python environment. Optionally supply a Python executable and an unused port.
-2. Start the service.
-3. Explicitly import your logged-in SOLO CN or CN desktop account. Only that click reads desktop storage; the source file is never modified.
-4. Return to the embedded console. Its original overview, accounts/check-in, usage, relay settings and model tests remain available. Connect models in the new **DSH 模型管理** tab.
-5. Select any visible TRAE model in the native composer picker and choose its advertised reasoning strength. Show/hide controls stay inside the console. Its header provides refresh, open in new window, and a separate service-settings view. Switching settings keeps the iframe alive.
+### First-time setup
 
-### Enable check-in and rotation
+1. Open **TRAE 控制台 → 服务设置**, prepare the environment, then start the service.
+2. Select **TRAE SOLO CN** or **Trae CN** and import your logged-in desktop account, or return to the console for web authorization.
+3. In **DSH 模型管理**, connect the models to dsh's model picker.
+4. Select a model and its reasoning strength in the composer. Manage show/hide preferences in the console.
 
-1. In **账号与签到**, add accounts and configure each account's model-request switch. Disabling requests retains the account for separate check-in management.
-2. In **自动签到**, enable the schedule, choose a Beijing-time daily time and save. **立即执行** runs it manually; the panel shows previous/next runs and results.
-3. In **轮询与设置 → 多账号轮询**, enable rotation, choose **顺序轮询** (round-robin) or **积分优先** (cached-credit ordering), and save. Refresh account credits first when you want the latter to reflect newer balances.
+First startup does not import accounts. Desktop import is explicitly initiated by you and leaves TRAE client login files unchanged.
 
-## Discover and show/hide models
+## Console navigation
 
-Desktop import, account switching and model connection automatically read the
-catalog once. Catalog failure does not undo a successful sign-in; it reports a
-warning and retains the previous list.
+| Task | Location |
+| --- | --- |
+| Add or switch accounts, schedule check-in | **账号与签到** |
+| Enable round-robin or credit-priority rotation | **轮询与设置 → 多账号轮询** |
+| Refresh, show or hide models | **DSH 模型管理** |
+| Inspect credits, tokens and consumption | **概览 / 消费记录** |
+| Prepare, start or stop the relay | **服务设置** in the header |
 
-After signing in, click **发现 / 刷新可用模型** inside the original console's **DSH 模型管理** tab. The active account's Remote/SOLO configs supply genuine model IDs, display names, context limits, image support and reasoning options. Only advertised supported strengths are offered: light → Low, high → High, extra_high → Xhigh. Models without advertised controls use the upstream default. Discovery makes catalog requests, not billable inference probes; model access still depends on account entitlement, quota and upstream availability.
+See the [user guide](docs/usage.en.md) for detailed setup, account policies, model behavior and troubleshooting.
 
-Search by name/ID and use **显示到 dsh** to show/hide models individually, or use the bulk controls. Connected routes synchronize immediately through DSH's Settings API. Hiding removes a model from DSH's configured catalog; sessions still using it must switch models. Hiding all removes this plugin's provider temporarily, and showing any model restores it. Other providers and saved defaults are preserved.
+## FAQ
 
-Successful discoveries and visibility preferences persist across restarts and refreshes. Failed discovery preserves the previous list; preferences for temporarily absent models are retained. Refresh after changing accounts. Flash sorts first when available; mixed/non-reasoning catalogs do not inherit an invalid shared High default. Prepared runner files update on plugin reload without replacing account data or reinstalling dependencies.
+**Does closing dsh stop the relay?** Closing Desktop to its tray keeps it running. Full exit, Host termination or plugin disable stops the relay and check-in scheduler.
 
-Download the web authorization helper from an authorized console. It targets
-this instance and carries only one credential-submission grant valid for 15
-minutes. Download it again after expiry. On Windows keep `start_auth.bat` beside
-the downloaded `web_login.py`. Desktop import does not need the OAuth helper.
+**Why do models and reasoning options differ?** The active account supplies the catalog. Unadvertised strengths are omitted; models without advertised controls use the upstream default. Refresh the catalog after switching accounts.
 
-The plugin does not change existing model defaults or other provider configuration.
-TRAE decides actual model access, quota and availability; no automatic substitute
-model is used. International-edition protocol support and remote-browser access to
-the Host's loopback console are outside this release's scope.
+**Does hiding a model affect existing sessions?** Hiding removes it from dsh's configured catalog. Switch sessions still using it first. Showing it restores the choice while preserving other providers and saved defaults.
 
-## Lifecycle and private storage
+**Are international accounts or remote browsers supported?** This release targets the China-edition protocol and local Desktop / Web. The full console uses the Host's loopback address; remote-browser access is not supported.
 
-After preparation the relay starts with dsh. Plugin disable, Host exit and complete
-dsh exit stop its whole process tree. Closing the desktop window to its tray keeps
-the Host and relay alive. Windows uses a kill-on-close Job Object; POSIX uses an
-owned process group and monitors the Host.
+## Development and contribution
 
-State lives in `$DSH_HOME/plugins/dsh-trae-relay`, or `~/.dsh/plugins/dsh-trae-relay`.
-Override with `DSH_TRAE_RELAY_HOME`; use distinct directories for multiple Hosts.
-The private venv, relay account copies, configuration and logs stay outside the
-installed package. Secrets must never be committed or attached to issues.
-
-Only loopback is served. Model requests require the private API key. Console
-sessions use an HttpOnly cookie and same-origin write checks. Windows initialization
-restricts the directory ACL; POSIX uses private directory/config modes. Connecting
-adds the plugin's own `DSH_TRAE_RELAY_API_KEY` credential and writes only its
-`llm-pi-ai.providers.trae-relay` field through DSH's revision-checked Settings
-API. Other providers and model defaults are preserved. Disconnecting removes
-only that owned provider and keeps credentials/data. Startup/exit does not
-rewrite model settings; disconnect before disabling or uninstalling.
-
-Console model controls use a private authenticated relay-to-Host bridge. Its
-secret stays in child-process memory, never in browser source, console URLs or
-account/configuration files. The authorized console session can manage only
-the plugin's model actions; cross-origin writes are refused. The same controls
-work from the embedded console and its separate browser window.
-
-Uninstall does not erase account data. Exit dsh before manually deleting the
-plugin state and removing its credential reference. An occupied port is refused;
-the plugin never adopts or terminates unrelated services. Setup preserves account
-data when repeated. No global Python, proxy or Git configuration is changed.
-
-## Development and validation
+Report problems through [Issues](https://github.com/FuSheng-cs/dsh-trae-relay/issues) or submit a pull request.
 
 ```sh
 npm test
@@ -124,18 +109,10 @@ npm run check
 npm pack
 ```
 
-Initialize `RelayRuntime` in a disposable directory and set `DSH_RELAY_TEST_HOME`
-to run real-process integration tests. They use synthetic credentials, never
-personal TRAE storage or billable upstream inference. They verify private access,
-single-use console entry, read-only import, model-enable state, clean shutdown and
-abrupt Host-exit cleanup. With `PYTHONPATH=vendor/trae2api-cn`, run
-`python -m unittest discover -s tests/engine` for the attributed upstream SSE,
-tool-protocol and effort-mapping tests.
+The [contribution guide](CONTRIBUTING.md) covers project structure, isolated testing and packaging. CI runs on Windows, Ubuntu and macOS and checks plugin behavior, real dsh installation, model synchronization and service lifecycle.
 
-Real DSH smoke tests also discover a simulated upstream catalog, synchronize capabilities and visibility, recover after hiding all models, and preserve an unrelated provider. Test-only upstream overrides are confined to verified disposable `work/` engine copies and excluded from published archives.
+## Credits and license
 
-CI targets Windows, Ubuntu and macOS. Live account entitlement and perpetual
-upstream availability are not asserted by offline tests. Releases include the
-prebuilt archive and SHA-256 checksum; installation requires no build scripts.
+The relay engine and original console come from [autumnsentiment/Trae2api-cn](https://github.com/autumnsentiment/Trae2api-cn), pinned to v1.0.4. This project uses the [MIT license](LICENSE) and retains the upstream copyright and license. Provenance and upstream usage notices are recorded in [third-party notices](THIRD_PARTY_NOTICES.md).
 
-MIT, with the upstream engine's original MIT copyright retained.
+Independent community project. Account, interface and automation boundaries are documented in the [usage notice and disclaimer](DISCLAIMER.en.md).

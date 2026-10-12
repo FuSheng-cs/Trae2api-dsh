@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.2
+
+- Reorganize both READMEs around project overview, core features, preview, quick start and common questions.
+- Move detailed account/model/storage operations into bilingual user guides and add a contribution guide.
+- Keep the independent usage notices and upstream attribution, with disclaimer links in the README footer instead of the opening callout.
+- Include the linked guides and marketplace record in the prebuilt package. Runtime behavior is unchanged.
+
 ## 1.2.1
 
 - Include Chinese and English usage boundaries and disclaimers in the prebuilt package, with prominent README links.
