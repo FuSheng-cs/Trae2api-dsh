@@ -1,18 +1,20 @@
 # DSH 市场提交记录
 
-记录更新：2026-10-13（北京时间）。提交版本：[v1.2.1](https://github.com/FuSheng-cs/dsh-trae-relay/releases/tag/v1.2.1)。
+记录更新：2026-10-13（北京时间）。当前提交版本：[v1.2.2](https://github.com/FuSheng-cs/dsh-trae-relay/releases/tag/v1.2.2)。
+
+v1.2.2 重构了中英文 README，新增详细使用指南与贡献指南，免责声明入口移至首页文末并保留独立文件。运行功能不变；六个待审申请已更新版本说明，补充注册表的安装 tag 也更新为 v1.2.2。已合并的创意工坊条目继续指向同一维护仓库，无需重复登记。
 
 本记录覆盖主社区收录库、创意工坊和已核实的独立 DSH 目录。不同市场有各自的审查、同步及推荐规则；**提交成功不等于已收录、上架或获得安全/平台授权背书**。以下为提交后的状态快照，后续以链接中的维护者结果为准。
 
 | 渠道 | 本次处理 | 提交结果 |
 | --- | --- | --- |
-| awesome-dsh-plugin / dsh-market / dshmarket.com | 一天年龄门槛已满足，现有正式 PR 的年龄自查已更新；不做重复投稿或空提交。安装包仍指向 v1.2.1。 | [PR #7164](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/pull/7164)，构建检查成功，年龄检查仍为达标前的旧结果，等待自动复检和审核。 |
+| awesome-dsh-plugin / dsh-market / dshmarket.com | 一天年龄门槛已满足，现有正式 PR 的年龄自查已更新；不做重复投稿或空提交。安装包指向最新版 v1.2.2。 | [PR #7164](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/pull/7164)，构建检查成功，年龄检查仍为达标前的旧结果，等待自动复检和审核。 |
 | 创意工坊 / dsh-market.com | 社区索引 PR 于北京时间 2026-10-12 17:15:19 合并；已核实 main 索引、线上 manifest 和网页搜索结果均包含插件。 | **已上架**：[创意工坊](https://dsh-market.com/) → 插件 → 搜索 `TRAE`；[合并 PR #31](https://github.com/zhu1090093659/dsh-community-plugins/pull/31)，[线上清单](https://dsh-market.com/manifest/plugins.json)。 |
-| DSH Market / dsh.market | 按提交模板提供仓库、类型、作者简介、版本、安装方式与免责声明。 | [Issue #234](https://github.com/2BingLing/dsh-market/issues/234)，已收到自动确认，等待每日管道处理。 |
-| dshplugin.io | 按网站指定的 `plugin-submission` issue 入口提交 v1.2.1。 | [Issue #34](https://github.com/tjsdyy/dshplugin/issues/34)，待审。 |
+| DSH Market / dsh.market | 按提交模板提供仓库、类型、作者简介、版本、安装方式与说明，已更新至 v1.2.2。 | [Issue #234](https://github.com/2BingLing/dsh-market/issues/234)，已收到自动确认，等待每日管道处理。 |
+| dshplugin.io | 按网站指定的 `plugin-submission` issue 入口提交，现有申请已更新至 v1.2.2。 | [Issue #34](https://github.com/tjsdyy/dshplugin/issues/34)，待审。 |
 | DSH Hub / dshhub.org | 按仓库提交表单提供仓库、用途和安装方式。 | [Issue #49](https://github.com/coderPerseus/dsh-hub/issues/49)，待审。 |
 | DSH Marketplace / dshmarketplace.dev | 复查网页仍提示 GitHub 限流，查询 API 尚无本插件；保留已提交的公开申请和 topics 自动发现入口。此申请不声称获精选推荐。 | [Issue #17](https://github.com/DshMarketPlace/awesome-dsh-plugin/issues/17)，待维护者处理。 |
-| ydhrdh/dsh-marketplace（补充社区注册表） | 提交 v1.2.1 manifest 和生成的索引，固定 GitHub tag；`verified: false` 等待维护者验证。 | [PR #15](https://github.com/ydhrdh/dsh-marketplace/pull/15)，待审。 |
+| ydhrdh/dsh-marketplace（补充社区注册表） | 现有 manifest 和生成索引已更新至 v1.2.2，固定 GitHub tag；`verified: false` 等待维护者验证。 | [PR #15](https://github.com/ydhrdh/dsh-marketplace/pull/15)，待审。 |
 | dsh-ai.org | 目录记录的数据源包含 awesome-dsh-plugin；通过上述主收录库申请覆盖其同步源。单独查询尚未找到本插件。 | 等待主库收录与目录同步，没有声称已上架或单独获精选。 |
 | dshmarket.ai | 已核实其公开提交链接返回 HTTP 404，未找到可用投递入口。网站描述其目录来源于 npm；本机未登录 npm，未发布 npm 包。 | **未完成投递**，等待可用入口或可用 npm 发布身份，不伪造安装包名或成功状态。 |
 
@@ -22,8 +24,8 @@
 
 ## 版本与验证
 
-- [三系统 CI](https://github.com/FuSheng-cs/dsh-trae-relay/actions/runs/38215715862) 全部通过；release commit 为 `8ba4cc87bcdc2ff3c69e7714cfa9bc9c59176f1f`。
-- [公开安装包](https://github.com/FuSheng-cs/dsh-trae-relay/releases/download/v1.2.1/dsh-trae-relay.tgz) 下载后校验通过，SHA-256：`492e8e4a2224e423b5229bb3b260f60778ece000875fb19d0c22ba3a76d62eb3`；[校验文件](https://github.com/FuSheng-cs/dsh-trae-relay/releases/download/v1.2.1/SHA256SUMS.txt)。
+- [三系统 CI](https://github.com/FuSheng-cs/dsh-trae-relay/actions/runs/38321963539) 全部通过；release commit 为 `0a7fd6f1a27150d611f6ebda60dc3263a7c72fa2`。
+- [公开安装包](https://github.com/FuSheng-cs/dsh-trae-relay/releases/download/v1.2.2/dsh-trae-relay.tgz) 下载后校验通过，SHA-256：`bbbbe409d85d07706d6cad8313d9d0cd8a01a22e58e4479a91229a8b94d015a7`；[校验文件](https://github.com/FuSheng-cs/dsh-trae-relay/releases/download/v1.2.2/SHA256SUMS.txt)。
 - 安装包包含 [中文使用边界与免责声明](DISCLAIMER.md)、[English disclaimer](DISCLAIMER.en.md)、[上游署名及用途提示](THIRD_PARTY_NOTICES.md)，保留原始 MIT 许可证；声明不保证免除法律责任或赋予第三方服务权限。
 - 创意工坊索引校验通过，9 个索引测试通过；补充注册表 `npm run verify` 通过，8/8 条目有效并完成静态构建。
 - 运行时与 v1.2.0 一致：原有完整内嵌控制台、原生模型/思考档位菜单和控制台模型显示功能全部保留。
