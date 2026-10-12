@@ -2,16 +2,36 @@
 
 [中文](README.md)
 
-A community DeepSeek Harness plugin providing a managed local TRAE CN relay,
-the original full embedded management console, and model controls inside it.
+A community DeepSeek Harness plugin bringing **TRAE CN daily check-in,
+multi-account management and account rotation** into dsh, with account-provided
+models and reasoning strengths in the native composer picker.
 The relay engine is [autumnsentiment/Trae2api-cn](https://github.com/autumnsentiment/Trae2api-cn),
 pinned to v1.0.4; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). This is not an official DeepSeek/TRAE product.
 
-![TRAE model and effort menu in an isolated DSH profile](assets/model-selection.png)
+## Core features
+
+| Feature | What it provides | Console entry |
+| --- | --- | --- |
+| **Automatic daily check-in** | Sign in stored accounts sequentially at a configured Beijing-time schedule, skip accounts already checked in today, run immediately and inspect results. | 账号与签到 → 自动签到 |
+| **Multiple accounts** | Import desktop credentials or use web authorization, keep multiple accounts, switch the active account, and enable/disable model requests per account. | 账号与签到 |
+| **Account rotation** | Rotate among valid accounts enabled for model requests, using round-robin or an order based on cached remaining credits. | 轮询与设置 → 多账号轮询 |
+| **Credits and usage** | Query account credits/check-in status and inspect tokens, cache, requests and consumption records with daily summaries. | 概览 / 账号与签到 / 消费记录 |
+| **Models and reasoning** | Discover the account's models and configure their advertised Low/High/Xhigh strengths in dsh's native model picker. | DSH 模型管理 / composer |
+| **Model visibility** | Search, show/hide individual models or use bulk controls; retain preferences across refresh/restart and synchronize the dsh picker. | DSH 模型管理 |
+| **Full embedded console** | Keep the original overview, accounts/check-in, usage, relay settings and model tests inside dsh, with a separate-window option. | TRAE 控制台 sidebar |
+
+Automatic check-in and rotation start disabled. Enable and save them in the
+console when needed. Check-in runs only while the relay is running; a complete
+dsh exit stops both the relay and its scheduled work. No Docker is required,
+and the private Python environment prepares without changing system Python.
+
+## Screenshots
 
 ![The original full embedded console, using an isolated test account](assets/embedded-console.png)
 
 ![Model catalog and visibility controls using isolated test fixtures; actual models come from your account](assets/model-catalog.png)
+
+![TRAE model and effort menu in an isolated DSH profile](assets/model-selection.png)
 
 ## Install and use
 
@@ -33,6 +53,12 @@ the marketplace once the entry is accepted. Enable the plugin and open **TRAE �
 3. Explicitly import your logged-in SOLO CN or CN desktop account. Only that click reads desktop storage; the source file is never modified.
 4. Return to the embedded console. Its original overview, accounts/check-in, usage, relay settings and model tests remain available. Connect models in the new **DSH 模型管理** tab.
 5. Select any visible TRAE model in the native composer picker and choose its advertised reasoning strength. Show/hide controls stay inside the console. Its header provides refresh, open in new window, and a separate service-settings view. Switching settings keeps the iframe alive.
+
+### Enable check-in and rotation
+
+1. In **账号与签到**, add accounts and configure each account's model-request switch. Disabling requests retains the account for separate check-in management.
+2. In **自动签到**, enable the schedule, choose a Beijing-time daily time and save. **立即执行** runs it manually; the panel shows previous/next runs and results.
+3. In **轮询与设置 → 多账号轮询**, enable rotation, choose **顺序轮询** (round-robin) or **积分优先** (cached-credit ordering), and save. Refresh account credits first when you want the latter to reflect newer balances.
 
 ## Discover and show/hide models
 
