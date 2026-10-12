@@ -14,6 +14,9 @@ from fastapi import Request, Query
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from src import auth, trae_decrypt
 from src.main import app, PUBLIC_PATHS
+from model_catalog import discover_models, restore_config_aliases
+
+restore_config_aliases(ENGINE.parent / 'config.json')
 
 PUBLIC_PATHS.update(('/dsh/console', '/dsh/session'))
 
@@ -53,7 +56,7 @@ async def private_console(request: Request, call_next):
     session = sessions.get(request.cookies.get(COOKIE_NAME, ''), 0) > time.monotonic()
     # Model requests, imports and ticket minting always require the API key.
     model_path = request.url.path.startswith('/v1/') or request.url.path == '/v1'
-    privileged = model_path or request.url.path in ('/dsh/import', '/dsh/ticket')
+    privileged = model_path or request.url.path in ('/dsh/import', '/dsh/ticket', '/dsh/models')
     if not bearer and (privileged or not session):
         return JSONResponse({'error': 'Open the console from DSH'}, status_code=401)
     return await call_next(request)
@@ -68,6 +71,14 @@ async def ticket():
     value = secrets.token_urlsafe(32)
     tickets[value] = now + 30
     return JSONResponse({'ticket': value}, headers={'Cache-Control': 'no-store'})
+
+
+@app.get('/dsh/models')
+async def account_models():
+    try:
+        return JSONResponse({'models': await discover_models()}, headers={'Cache-Control': 'no-store'})
+    except ValueError as error:
+        return JSONResponse({'error': str(error)}, status_code=400)
 
 
 @app.get('/dsh/console')

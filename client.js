@@ -47,7 +47,10 @@ window.__ModuleLoader__.load({
         [edition, setEdition] = React.useState("solo"),
         [directory, setDirectory] = React.useState("");
       const [consoleURL, setConsoleURL] = React.useState("");
+      const [modelCatalog, setModelCatalog] = React.useState(null);
+      const [modelQuery, setModelQuery] = React.useState("");
       const alive = React.useRef(true);
+      const refreshSequence = React.useRef(0);
       const call = async (method, payload, signal) => {
         const r = await ctx.connection.rpc.call(
           "/api",
@@ -59,15 +62,20 @@ window.__ModuleLoader__.load({
         return r.value;
       };
       const refresh = async (signal) => {
-        const status = await call("status", {}, signal);
-        if (!alive.current) return;
+        const sequence = ++refreshSequence.current;
+        const [status, models] = await Promise.all([
+          call("status", {}, signal),
+          call("models", {}, signal),
+        ]);
+        if (!alive.current || sequence !== refreshSequence.current) return;
         setState(status);
+        setModelCatalog(models);
         if (status.state === "running") {
           const [data, url] = await Promise.all([
             call("accounts", {}, signal),
             call("console", {}, signal),
           ]);
-          if (alive.current) {
+          if (alive.current && sequence === refreshSequence.current) {
             setAccounts(data.accounts || []);
             setConsoleURL(url);
           }
@@ -99,9 +107,15 @@ window.__ModuleLoader__.load({
         setError("");
         setNotice("");
         try {
-          await call(method, payload);
+          const result = await call(method, payload);
           await refresh();
-          if (alive.current) setNotice(message || "操作完成。");
+          if (alive.current)
+            setNotice(
+              (message || "操作完成。") +
+                (result?.modelWarning
+                  ? " 模型目录读取失败，旧列表已保留：" + result.modelWarning
+                  : ""),
+            );
         } catch (e) {
           if (alive.current) setError(e.message);
         } finally {
@@ -133,6 +147,18 @@ window.__ModuleLoader__.load({
         );
       const running = state?.state === "running",
         prepared = state?.prepared;
+      const modelRows = (modelCatalog?.models || []).filter((model) =>
+        (model.name + " " + model.id)
+          .toLowerCase()
+          .includes(modelQuery.toLowerCase()),
+      );
+      const strength = { light: "Low", high: "High", extra_high: "Xhigh" };
+      const visibility = (changes) =>
+        act(
+          "modelVisibility",
+          { changes },
+          "模型显示设置已保存，并同步到 dsh。",
+        );
       const states = {
         unprepared: "未初始化",
         preparing: "正在准备环境",
@@ -254,7 +280,7 @@ window.__ModuleLoader__.load({
             h(
               "p",
               { className: "tr-muted" },
-              "默认提供 DeepSeek V4.1 Flash，思考强度为 Low / High / Xhigh。接入后在对话模型菜单选择 TRAE CN；已有默认模型保持原样。",
+              "预置 DeepSeek V4.1 Flash；登录后可发现其他可用模型。思考档位按各模型的上游能力配置，在对话模型菜单中选择。",
             ),
             h(
               "div",
@@ -265,7 +291,7 @@ window.__ModuleLoader__.load({
                   act(
                     "connect",
                     {},
-                    "已接入：请在模型菜单选择 TRAE CN / DeepSeek V4.1 Flash。",
+                    "模型已接入：请在对话模型菜单选择 TRAE CN 下的模型。",
                   ),
                 !running || state?.connected,
                 true,
@@ -288,8 +314,180 @@ window.__ModuleLoader__.load({
           ),
           h(
             "div",
+            {
+              className: "tr-card",
+              id: "tr-model-catalog",
+              role: "region",
+              "aria-label": "模型与思考强度",
+            },
+            h("h2", null, "3 · 模型与思考强度"),
+            state?.catalogError
+              ? h(
+                  "div",
+                  { className: "tr-error", role: "alert" },
+                  state.catalogError,
+                )
+              : null,
+            h(
+              "p",
+              { className: "tr-muted" },
+              modelCatalog?.source === "account"
+                ? "读取当前账号实际模型配置，不包含兼容别名。刷新失败时保留已有列表。"
+                : "目前使用预置模型；登录后点击发现/刷新模型，加载账号提供的模型和思考档位。",
+            ),
+            h(
+              "div",
+              { className: "tr-row" },
+              button(
+                "发现 / 刷新可用模型",
+                () =>
+                  act(
+                    "refreshModels",
+                    {},
+                    "可用模型与思考档位已更新，显示偏好已保留。",
+                  ),
+                !running,
+                true,
+              ),
+              button(
+                "显示全部",
+                () =>
+                  visibility(
+                    (modelCatalog?.models || []).map((model) => ({
+                      id: model.id,
+                      visible: true,
+                    })),
+                  ),
+                !prepared,
+              ),
+              button(
+                "隐藏全部",
+                () =>
+                  visibility(
+                    (modelCatalog?.models || []).map((model) => ({
+                      id: model.id,
+                      visible: false,
+                    })),
+                  ),
+                !prepared,
+              ),
+            ),
+            h(
+              "p",
+              { className: "tr-muted" },
+              `${modelCatalog?.models.length || 0} 个模型 · ${(modelCatalog?.models || []).filter((model) => model.visible).length} 个显示到 dsh`,
+              modelCatalog?.updatedAt
+                ? " · 更新于 " +
+                    new Date(modelCatalog.updatedAt).toLocaleString()
+                : "",
+            ),
+            h(
+              "label",
+              { className: "tr-field" },
+              "搜索模型",
+              h("input", {
+                className: "tr-input",
+                value: modelQuery,
+                onChange: (event) => setModelQuery(event.target.value),
+                placeholder: "模型名称或 ID",
+              }),
+            ),
+            h(
+              "div",
+              { className: "tr-scroll" },
+              h(
+                "table",
+                { className: "tr-table" },
+                h(
+                  "thead",
+                  null,
+                  h(
+                    "tr",
+                    null,
+                    ...["模型", "思考档位", "上下文 / 输出", "显示到 dsh"].map(
+                      (label) => h("th", { key: label, scope: "col" }, label),
+                    ),
+                  ),
+                ),
+                h(
+                  "tbody",
+                  null,
+                  ...modelRows.map((model) =>
+                    h(
+                      "tr",
+                      { key: model.id },
+                      h(
+                        "td",
+                        null,
+                        h("div", null, model.name),
+                        h("code", { className: "tr-code" }, model.id),
+                      ),
+                      h(
+                        "td",
+                        null,
+                        model.reasoningLevels.length
+                          ? model.reasoningLevels
+                              .map((level) => strength[level])
+                              .join(" / ")
+                          : model.reasoningSupport === false
+                            ? "无思考档位"
+                            : "由上游控制",
+                        model.defaultReasoning
+                          ? h(
+                              "div",
+                              { className: "tr-muted" },
+                              "上游默认 " + strength[model.defaultReasoning],
+                            )
+                          : null,
+                      ),
+                      h(
+                        "td",
+                        null,
+                        model.contextWindow.toLocaleString() +
+                          " / " +
+                          model.maxTokens.toLocaleString(),
+                      ),
+                      h(
+                        "td",
+                        null,
+                        h(
+                          "label",
+                          null,
+                          h("input", {
+                            type: "checkbox",
+                            checked: model.visible,
+                            disabled: busy || !prepared,
+                            "aria-label": "在 dsh 显示 " + model.name,
+                            onChange: (event) =>
+                              visibility([
+                                { id: model.id, visible: event.target.checked },
+                              ]),
+                          }),
+                          model.visible ? " 显示" : " 隐藏",
+                        ),
+                      ),
+                    ),
+                  ),
+                  modelRows.length
+                    ? null
+                    : h(
+                        "tr",
+                        null,
+                        h("td", { colSpan: 4 }, "没有匹配的模型。"),
+                      ),
+                ),
+              ),
+            ),
+            h(
+              "p",
+              { className: "tr-muted" },
+              "隐藏会从 dsh 提供的模型目录中移除该模型；使用它的已有会话需切换模型。重新显示可恢复接入。",
+            ),
+          ),
+          h(
+            "div",
             { className: "tr-card" },
-            h("h2", null, "3 · 登录与账号"),
+            h("h2", null, "4 · 登录与账号"),
             h(
               "p",
               { className: "tr-muted" },

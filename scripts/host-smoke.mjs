@@ -2,12 +2,16 @@ import { spawn } from "node:child_process";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { resolve, join } from "node:path";
 import assert from "node:assert/strict";
-import { RelayRuntime } from "../lib/runtime.js";
+import { RelayRuntime, atomicJson } from "../lib/runtime.js";
+import { createHash } from "node:crypto";
+import { installFixtureCatalog } from "./fixture-upstream.mjs";
 
 const cli = resolve("work/test-host/node_modules/@deepseek-ai/dsh/lib/bin.js");
 const home = resolve("work/host-smoke-home");
 const runtimeHome = process.env.DSH_RELAY_TEST_HOME;
-const packageVersion = JSON.parse(await readFile('package.json','utf8')).version;
+const packageVersion = JSON.parse(
+  await readFile("package.json", "utf8"),
+).version;
 if (!runtimeHome)
   throw new Error("Set DSH_RELAY_TEST_HOME to a prepared disposable runtime.");
 const env = {
@@ -16,6 +20,25 @@ const env = {
   DSH_TRAE_RELAY_HOME: resolve(runtimeHome),
   PYTHONDONTWRITEBYTECODE: "1",
 };
+await installFixtureCatalog(runtimeHome);
+// Repeated local runs start from a clean preference fixture, never real data.
+const runtimeConfigPath = join(resolve(runtimeHome), "config.json");
+const runtimeConfig = JSON.parse(await readFile(runtimeConfigPath, "utf8"));
+for (const key of [
+  "models",
+  "hiddenModels",
+  "catalogSource",
+  "catalogUpdatedAt",
+])
+  delete runtimeConfig[key];
+runtimeConfig.connected = false;
+await atomicJson(runtimeConfigPath, runtimeConfig);
+const archive = await readFile(`dsh-trae-relay-${packageVersion}.tgz`);
+const isolatedArchive = resolve(
+  "work",
+  `host-smoke-${createHash("sha256").update(archive).digest("hex").slice(0, 16)}.tgz`,
+);
+await writeFile(isolatedArchive, archive);
 async function command(args) {
   return await new Promise((done, fail) => {
     const c = spawn(process.execPath, [cli, ...args], {
@@ -36,13 +59,7 @@ async function command(args) {
     );
   });
 }
-await command([
-  "plugin",
-  "--profile",
-  "web",
-  "add",
-  resolve(`dsh-trae-relay-${packageVersion}.tgz`),
-]);
+await command(["plugin", "--profile", "web", "add", isolatedArchive]);
 const patch = join(home, "profiles", "web", "cordis.patch.yml");
 const fixture =
   "- id: llm-pi-ai\n  config:\n    providers:\n      preservation-fixture:\n        api: openai-completions\n        baseURL: https://unused.example.invalid/v1\n        apiKeyEnv: UNUSED_FIXTURE_KEY\n        models:\n          - id: fixture-model\n";
@@ -106,6 +123,66 @@ try {
   assert.ok(connected.includes("trae-relay:"));
   assert.ok(connected.includes("xhigh: extra_high"));
   assert.ok(connected.includes("low: light"));
+  const desktop = join(home, "fixture", "User");
+  await mkdir(join(desktop, "globalStorage"), { recursive: true });
+  await writeFile(
+    join(desktop, "globalStorage", "storage.json"),
+    JSON.stringify({
+      "iCubeAuthInfo://icube.cloudide": JSON.stringify({
+        token: "synthetic-model-test-only",
+        userId: "catalog-fixture",
+        expiredAt: "2099-01-01T00:00:00Z",
+      }),
+    }),
+  );
+  await call("import", { edition: "solo", directory: desktop });
+  const discovered = await call("refreshModels");
+  assert.equal(discovered.source, "account");
+  assert.equal(discovered.models.length, 3);
+  assert.deepEqual(
+    discovered.models.find((m) => m.id === "example-reasoner").reasoningLevels,
+    ["light", "high"],
+  );
+  assert.deepEqual(
+    discovered.models.find((m) => m.id === "example-plain").reasoningLevels,
+    [],
+  );
+  assert.ok((await readFile(patch, "utf8")).includes("example-plain"));
+  await call("modelVisibility", {
+    changes: [{ id: "example-reasoner", visible: false }],
+  });
+  assert.equal(
+    (await call("models")).models.find((m) => m.id === "example-reasoner")
+      .visible,
+    false,
+  );
+  assert.ok(!(await readFile(patch, "utf8")).includes("id: example-reasoner"));
+  await call("refreshModels");
+  assert.equal(
+    (await call("models")).models.find((m) => m.id === "example-reasoner")
+      .visible,
+    false,
+    "refresh lost a hidden preference",
+  );
+  await call("modelVisibility", {
+    changes: discovered.models.map((m) => ({ id: m.id, visible: false })),
+  });
+  assert.equal((await call("status")).providerAvailable, false);
+  assert.ok((await readFile(patch, "utf8")).includes("preservation-fixture"));
+  await call("modelVisibility", {
+    changes: [{ id: "example-plain", visible: true }],
+  });
+  assert.equal((await call("status")).providerAvailable, true);
+  const disk = new RelayRuntime({ directory: resolve(runtimeHome) });
+  await disk.load();
+  assert.equal(
+    disk.modelCatalog().models.find((m) => m.id === "example-reasoner").visible,
+    false,
+  );
+  assert.equal(
+    disk.modelCatalog().models.find((m) => m.id === "example-plain").visible,
+    true,
+  );
   await call("disconnect");
   assert.equal((await call("status")).providerAvailable, false);
   const disconnected = await readFile(patch, "utf8");
@@ -116,7 +193,7 @@ try {
   await call("start");
   assert.equal((await call("status")).state, "running");
   console.log(
-    "Real DSH install, authenticated controls, model registration, effort metadata and unrelated-provider preservation passed.",
+    "Real DSH install, model discovery/capabilities, visibility, persistence, all-hidden recovery and unrelated-provider preservation passed.",
   );
 } finally {
   child.kill("SIGTERM");

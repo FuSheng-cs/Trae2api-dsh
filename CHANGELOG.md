@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.0
+
+- Discover the active account's real Remote/SOLO model configs, display names, context limits, image capability and supported reasoning levels.
+- Configure each model's supported Low/High/Xhigh options; do not apply a shared High default to non-reasoning or incompatible models.
+- Native model search and per-model/bulk show/hide controls, with persisted preferences and automatic synchronization through DSH's Settings API.
+- Preserve hidden preferences across discovery refreshes; recover from hiding every model without changing other providers or model defaults.
+- Update prepared runner files on plugin reload without reinstalling Python dependencies or replacing account data.
+
 ## 1.0.1
 
 - Open the full console with a normal authenticated HTTP link. This supports Desktop's system-browser redirect policy, which deliberately denies JavaScript popup handles.

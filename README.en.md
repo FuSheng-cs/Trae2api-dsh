@@ -30,6 +30,18 @@ the marketplace once the entry is accepted. Enable the plugin and open **TRAE �
 4. Connect the model route and select **TRAE CN / DeepSeek V4.1 Flash (TRAE)** in the model picker. Low, High and Xhigh map to light, high and extra_high; High is the initial route default.
 5. Open the full console for advanced account/usage/settings controls. Allow popups. Its one-use entry expires after 30 seconds and does not contain the relay API key.
 
+## Discover and show/hide models
+
+Desktop import, account switching and model connection automatically read the
+catalog once. Catalog failure does not undo a successful sign-in; it reports a
+warning and retains the previous list.
+
+After signing in, click **发现 / 刷新可用模型** in **模型与思考强度**. The active account's Remote/SOLO configs supply genuine model IDs, display names, context limits, image support and reasoning options. Only advertised supported strengths are offered: light → Low, high → High, extra_high → Xhigh. Models without advertised controls use the upstream default. Discovery makes catalog requests, not billable inference probes; model access still depends on account entitlement, quota and upstream availability.
+
+Search by name/ID and use **显示到 dsh** to show/hide models individually, or use the bulk controls. Connected routes synchronize immediately through DSH's Settings API. Hiding removes a model from DSH's configured catalog; sessions still using it must switch models. Hiding all removes this plugin's provider temporarily, and showing any model restores it. Other providers and saved defaults are preserved.
+
+Successful discoveries and visibility preferences persist across restarts and refreshes. Failed discovery preserves the previous list; preferences for temporarily absent models are retained. Refresh after changing accounts. Flash sorts first when available; mixed/non-reasoning catalogs do not inherit an invalid shared High default. Prepared runner files update on plugin reload without replacing account data or reinstalling dependencies.
+
 Download the web authorization helper from an authorized console. It targets
 this instance and carries only one credential-submission grant valid for 15
 minutes. Download it again after expiry. On Windows keep `start_auth.bat` beside
@@ -81,6 +93,8 @@ single-use console entry, read-only import, model-enable state, clean shutdown a
 abrupt Host-exit cleanup. With `PYTHONPATH=vendor/trae2api-cn`, run
 `python -m unittest discover -s tests/engine` for the attributed upstream SSE,
 tool-protocol and effort-mapping tests.
+
+Real DSH smoke tests also discover a simulated upstream catalog, synchronize capabilities and visibility, recover after hiding all models, and preserve an unrelated provider. Test-only upstream overrides are confined to verified disposable `work/` engine copies and excluded from published archives.
 
 CI targets Windows, Ubuntu and macOS. Live account entitlement and perpetual
 upstream availability are not asserted by offline tests. Releases include the

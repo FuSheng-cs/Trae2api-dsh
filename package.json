@@ -1,6 +1,6 @@
 {
   "name": "dsh-trae-relay",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Managed TRAE CN relay and account console for DeepSeek Harness",
   "type": "module",
   "license": "MIT",

@@ -1,0 +1,30 @@
+{
+  "deepseek-v4.1-flash": {
+    "name": "deepseek-v4.1-flash",
+    "display_name": "DeepSeek V4.1 Flash",
+    "context_window_tokens": { "dev": 200000, "max": 1000000 },
+    "reasoning_effort_config": {
+      "support_thinking": true,
+      "options": ["light", "high", "extra_high"],
+      "default_level": "high"
+    }
+  },
+  "example-reasoner": {
+    "name": "example-reasoner",
+    "display_name": "Example Reasoner",
+    "context_window_size": { "default": 128000 },
+    "max_output_tokens": 16384,
+    "reasoning_effort_config": {
+      "support_thinking": true,
+      "options": ["light", "high"],
+      "default_level": "high"
+    }
+  },
+  "example-plain": {
+    "name": "example-plain",
+    "display_name": "Example Plain",
+    "context_window": 64000,
+    "reasoning_effort_config": { "support_thinking": false, "options": [] },
+    "multimodal": true
+  }
+}

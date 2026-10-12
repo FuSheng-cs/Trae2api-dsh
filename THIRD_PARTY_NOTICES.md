@@ -14,6 +14,6 @@ independent community integration, not an official TRAE or DeepSeek product.
 
 Local modifications to the snapshot: remove token-prefix logging and pin the
 tested direct Python dependencies, including HTTPX SOCKS support. Runtime
-extensions are in `python/relay_entry.py`; the upstream protocol code otherwise
+extensions are in `python/relay_entry.py` and `python/model_catalog.py`; the upstream protocol code otherwise
 remains unchanged. Upstream updates are reviewed and pinned, never fetched
 automatically on plugin startup.
