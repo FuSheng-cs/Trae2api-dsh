@@ -2,6 +2,8 @@
 
 记录更新：2026-10-13（北京时间）。项目现名 **Trae2api-dsh**；最新发布见 [GitHub Release](https://github.com/FuSheng-cs/Trae2api-dsh/releases/latest)。以下包含已提交申请及历史验证快照。
 
+2026-10-13 跟进：DSH Market 已确认收录并在网页显示插件详情；DSH Marketplace 的公开目录 API 也已索引规范仓库。主收录库的 `Submission gate` 和 `check` 均通过，仍等待合并。DSH Market 详情页的安装命令和准备要求存在误识别，已提交 [数据修正 #242](https://github.com/2BingLing/dsh-market/issues/242)。
+
 **v1.3.0** 已发布：仓库、安装包及中英文 README 统一新名称，包含原创生成图标；主库和六个既有待审材料已更新。创意工坊已上架的条目保留同一 ID，通过 [名称与仓库链接更新 PR #34](https://github.com/zhu1090093659/dsh-community-plugins/pull/34) 请求同步新名称，不新增重复插件。
 
 v1.2.2 重构了中英文 README，新增详细使用指南与贡献指南，免责声明入口移至首页文末并保留独立文件。运行功能不变；六个待审申请已更新版本说明，补充注册表的安装 tag 也更新为 v1.2.2。已合并的创意工坊条目继续指向同一维护仓库，无需重复登记。
@@ -10,19 +12,19 @@ v1.2.2 重构了中英文 README，新增详细使用指南与贡献指南，免
 
 | 渠道 | 本次处理 | 提交结果 |
 | --- | --- | --- |
-| awesome-dsh-plugin / dsh-market / dshmarket.com | 一天年龄门槛已满足，使用现有正式 PR 更新名称和最新版下载入口，不重复登记。 | [PR #7164](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/pull/7164)，等待自动复检和审核。 |
+| awesome-dsh-plugin / dsh-market / dshmarket.com | 已通过年龄、bundle、提交数量门槛与构建检查，继续使用单文件正式 PR，不重复登记。 | [PR #7164](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/pull/7164)，**全部检查通过，待维护者合并**。 |
 | 创意工坊 / dsh-market.com | 原条目已上架，保留原 ID；新名称与规范仓库链接通过单条目更新 PR 同步。 | **已上架，改名待审**：[创意工坊](https://dsh-market.com/) → 插件 → 搜索 `TRAE`；[更新 PR #34](https://github.com/zhu1090093659/dsh-community-plugins/pull/34)，[原合并 PR #31](https://github.com/zhu1090093659/dsh-community-plugins/pull/31)。 |
-| DSH Market / dsh.market | 按提交模板提供仓库、类型、作者简介、版本、安装方式与说明，已更新至 Trae2api-dsh v1.3.0。 | [Issue #234](https://github.com/2BingLing/dsh-market/issues/234)，已收到自动确认，等待每日管道处理。 |
+| DSH Market / dsh.market | 已确认规范仓库收录，原申请自动关闭；实际网页可见。详情页误写 `git clone` 与无需配置，已请求纠正为 dsh 包安装及 Python/账号准备要求。 | **已上架**：[插件详情](https://dsh.market/?plugin=FuSheng-cs%2FTrae2api-dsh)，[收录确认 #234](https://github.com/2BingLing/dsh-market/issues/234#issuecomment-6138989624)，[数据修正 #242](https://github.com/2BingLing/dsh-market/issues/242) 待处理。 |
 | dshplugin.io | 按网站指定的 `plugin-submission` issue 入口提交，现有申请已更新至 Trae2api-dsh v1.3.0。 | [Issue #34](https://github.com/tjsdyy/dshplugin/issues/34)，待审。 |
 | DSH Hub / dshhub.org | 按仓库提交表单提供仓库、用途和安装方式。 | [Issue #49](https://github.com/coderPerseus/dsh-hub/issues/49)，待审。 |
-| DSH Marketplace / dshmarketplace.dev | 复查网页仍提示 GitHub 限流，查询 API 尚无本插件；保留已提交的公开申请和 topics 自动发现入口。此申请不声称获精选推荐。 | [Issue #17](https://github.com/DshMarketPlace/awesome-dsh-plugin/issues/17)，待维护者处理。 |
+| DSH Marketplace / dshmarketplace.dev | 提交表单显示已在目录中，公开 API 返回规范仓库和 `github:FuSheng-cs/Trae2api-dsh` 安装命令；`installable: true`、`installCheck: null`。无需重复投递。 | **已进入目录**：[目录 API](https://dshmarketplace.dev/api/v1/plugins?q=FuSheng-cs%2FTrae2api-dsh&limit=5)，[原申请 #17](https://github.com/DshMarketPlace/awesome-dsh-plugin/issues/17) 已说明确认结果并关闭；不声称完成安装检查或精选审核。 |
 | ydhrdh/dsh-marketplace（补充社区注册表） | 现有 manifest 和生成索引已更新至 Trae2api-dsh v1.3.0，固定 GitHub tag；保留原索引 ID，`verified: false` 等待验证。 | [PR #15](https://github.com/ydhrdh/dsh-marketplace/pull/15)，待审。 |
 | dsh-ai.org | 目录记录的数据源包含 awesome-dsh-plugin；通过上述主收录库申请覆盖其同步源。单独查询尚未找到本插件。 | 等待主库收录与目录同步，没有声称已上架或单独获精选。 |
 | dshmarket.ai | 已核实其公开提交链接返回 HTTP 404，未找到可用投递入口。网站描述其目录来源于 npm；本机未登录 npm，未发布 npm 包。 | **未完成投递**，等待可用入口或可用 npm 发布身份，不伪造安装包名或成功状态。 |
 
 仓库已公开并带 `dsh-plugin` / `deepseek-harness` topics，根目录声明 `dsh.bundle`、`dsh.client` 和 `cordis.patch.yml`。共用 awesome-dsh-plugin 数据源的市场前端由同一个主库申请覆盖，避免重复登记同一插件。
 
-主库的一天年龄门槛已在北京时间 **2026-10-12 23:57:51** 满足。自动复检工作流计划每六小时运行一次（UTC `19 */6 * * *`，实际启动可能延迟，并有每批数量限制）；现有的旧失败结果不能视为新的拒绝。满足时间条件仍需市场复检和维护者决定；请查看现有 PR，不重复开新申请。
+主库的一天年龄门槛已在北京时间 **2026-10-12 23:57:51** 满足，最新门槛检查于北京时间 **2026-10-13 08:01:18** 通过；构建检查也成功。当前等待维护者合并，请查看现有 PR，不重复开新申请。
 
 ## 版本与验证
 
