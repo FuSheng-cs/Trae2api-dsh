@@ -4,7 +4,7 @@
 
 <h1 align="center">Trae2api-dsh</h1>
 
-<p align="center">在 DeepSeek Harness 中使用 TRAE CN 模型，集中管理账号、签到、轮询与用量。</p>
+<p align="center">把 TRAE 账号的模型额度接入 dsh，直接在 DeepSeek Harness 中使用。</p>
 
 [![Release](https://img.shields.io/github/v/release/FuSheng-cs/Trae2api-dsh?label=release)](https://github.com/FuSheng-cs/Trae2api-dsh/releases/latest)
 [![CI](https://github.com/FuSheng-cs/Trae2api-dsh/actions/workflows/ci.yml/badge.svg)](https://github.com/FuSheng-cs/Trae2api-dsh/actions/workflows/ci.yml)
@@ -12,7 +12,7 @@
 
 [English](README.en.md) · [下载](https://github.com/FuSheng-cs/Trae2api-dsh/releases/latest) · [使用指南](docs/usage.zh-CN.md) · [问题反馈](https://github.com/FuSheng-cs/Trae2api-dsh/issues)
 
-**Trae2api-dsh** 是将 TRAE CN / TRAE SOLO CN 接入 DeepSeek Harness 的本地插件。它保留完整的账号与用量控制台，把账号提供的模型和思考档位接入 dsh 原生对话菜单，支持自动签到、多账号轮询和模型显示管理。
+**Trae2api-dsh** 让 dsh 使用你在 TRAE CN / TRAE SOLO CN 账号中的模型额度。导入账号后，即可在 dsh 原生对话菜单选择 TRAE 模型和思考强度，使用该账号的额度进行对话。内嵌控制台提供多账号管理、自动签到、账号轮询、用量统计和模型显示设置。
 
 [功能](#功能) · [界面](#界面预览) · [快速开始](#快速开始) · [日常使用](#日常使用) · [常见问题](#常见问题) · [项目文档](#项目文档)
 
@@ -20,6 +20,7 @@
 
 | 功能 | 说明 |
 | --- | --- |
+| **TRAE 额度接入** | 导入 TRAE 账号，在 dsh 中调用账号提供的模型并使用其模型额度。 |
 | **自动签到** | 按北京时间每日签到，跳过当天已签到账号；支持立即执行、上次与下次执行时间及结果查询。 |
 | **多账号管理** | 导入已登录的桌面账号或网页授权登录，切换当前账号，分别启用或禁用模型调用。 |
 | **账号轮询** | 在有效且启用的账号之间顺序轮询，或根据缓存的剩余积分排序调度。 |
@@ -130,4 +131,4 @@ CI 在 Windows、Ubuntu、macOS 上验证插件测试、真实 dsh 安装、模�
 
 ---
 
-反代引擎和原有管理界面来自 [autumnsentiment/Trae2api-cn](https://github.com/autumnsentiment/Trae2api-cn) v1.0.4，保留上游版权与许可。本项目是独立社区集成。相关说明：[MIT 许可](LICENSE) · [第三方说明](THIRD_PARTY_NOTICES.md) · [使用边界与免责声明](DISCLAIMER.md)。
+反代引擎和原有管理界面来自 [autumnsentiment/Trae2api-cn](https://github.com/autumnsentiment/Trae2api-cn) v1.0.4，保留上游版权与许可。相关说明：[MIT 许可](LICENSE) · [第三方说明](THIRD_PARTY_NOTICES.md) · [使用边界与免责声明](DISCLAIMER.md)。

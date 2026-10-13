@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.1
+
+- Lead plugin descriptions and both READMEs with using TRAE account model quota in dsh.
+- Keep marketplace summaries and author introductions focused on quota integration, account management, check-in, rotation, usage and model controls.
+- Retain the complete usage notices in their standalone files and README footer links; remove those statements from plugin summary copy.
+- Runtime behavior, account storage and model routing are unchanged.
+
 ## 1.3.0
 
 - Rename the public project and GitHub repository to Trae2api-dsh and the package to `trae2api-dsh`; align the bundle and Client loader names.

@@ -33,7 +33,7 @@ v1.2.2 重构了中英文 README，新增详细使用指南与贡献指南，免
 
 - [三系统 CI](https://github.com/FuSheng-cs/Trae2api-dsh/actions/runs/38321963539) 全部通过；release commit 为 `0a7fd6f1a27150d611f6ebda60dc3263a7c72fa2`。
 - [v1.2.2 历史安装包](https://github.com/FuSheng-cs/Trae2api-dsh/releases/download/v1.2.2/dsh-trae-relay.tgz) 下载后校验通过，SHA-256：`bbbbe409d85d07706d6cad8313d9d0cd8a01a22e58e4479a91229a8b94d015a7`；[校验文件](https://github.com/FuSheng-cs/Trae2api-dsh/releases/download/v1.2.2/SHA256SUMS.txt)。
-- 安装包包含 [中文使用边界与免责声明](DISCLAIMER.md)、[English disclaimer](DISCLAIMER.en.md)、[上游署名及用途提示](THIRD_PARTY_NOTICES.md)，保留原始 MIT 许可证；声明不保证免除法律责任或赋予第三方服务权限。
+- 安装包保留 [中文说明](DISCLAIMER.md)、[English notice](DISCLAIMER.en.md)、[第三方说明](THIRD_PARTY_NOTICES.md) 和原始 MIT 许可证。
 - 创意工坊索引校验通过，9 个索引测试通过；补充注册表 `npm run verify` 通过，8/8 条目有效并完成静态构建。
 - 运行时与 v1.2.0 一致：原有完整内嵌控制台、原生模型/思考档位菜单和控制台模型显示功能全部保留。
 

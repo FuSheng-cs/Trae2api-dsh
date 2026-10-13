@@ -186,7 +186,7 @@ window.__ModuleLoader__.load({
               { className: "tr-muted" },
               showSettings
                 ? "服务设置 · " + (labels[state?.state] || "正在连接…")
-                : "账号、用量和代理设置",
+                : "TRAE 额度接入、账号与用量管理",
             ),
           ),
           button("刷新控制台", refreshConsole, !running),

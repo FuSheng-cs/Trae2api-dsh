@@ -4,7 +4,7 @@
 
 <h1 align="center">Trae2api-dsh</h1>
 
-<p align="center">TRAE CN models in DeepSeek Harness, with accounts, check-in, rotation and usage in one console.</p>
+<p align="center">Use your TRAE account's model quota directly in DeepSeek Harness.</p>
 
 [![Release](https://img.shields.io/github/v/release/FuSheng-cs/Trae2api-dsh?label=release)](https://github.com/FuSheng-cs/Trae2api-dsh/releases/latest)
 [![CI](https://github.com/FuSheng-cs/Trae2api-dsh/actions/workflows/ci.yml/badge.svg)](https://github.com/FuSheng-cs/Trae2api-dsh/actions/workflows/ci.yml)
@@ -12,7 +12,7 @@
 
 [中文](README.md) · [Download](https://github.com/FuSheng-cs/Trae2api-dsh/releases/latest) · [User guide](docs/usage.en.md) · [Report an issue](https://github.com/FuSheng-cs/Trae2api-dsh/issues)
 
-**Trae2api-dsh** connects TRAE CN / TRAE SOLO CN accounts to DeepSeek Harness through a local plugin. It preserves the full account and usage console, registers account-provided models and reasoning strengths in the native composer, and adds automatic check-in, account rotation and model visibility controls.
+**Trae2api-dsh** lets dsh use the model quota in your TRAE CN / TRAE SOLO CN accounts. Import an account, select its models and reasoning strengths in the native dsh composer, and run conversations using that account's quota. The embedded console provides account management, daily check-in, rotation, usage statistics and model visibility controls.
 
 [Features](#features) · [Preview](#preview) · [Quick start](#quick-start) · [Everyday use](#everyday-use) · [FAQ](#faq) · [Documentation](#documentation)
 
@@ -20,6 +20,7 @@
 
 | Feature | Description |
 | --- | --- |
+| **TRAE quota integration** | Import a TRAE account and use its models and model quota from dsh. |
 | **Automatic check-in** | Run daily on a Beijing-time schedule, skip accounts already checked in, run immediately and inspect previous/next runs and results. |
 | **Multiple accounts** | Import a logged-in desktop account or authorize through the web, switch the active account and enable or disable requests per account. |
 | **Account rotation** | Rotate among valid enabled accounts, in round-robin order or an order based on cached remaining credits. |
@@ -130,4 +131,4 @@ CI covers Windows, Ubuntu and macOS with plugin tests, real dsh installation, mo
 
 ---
 
-The relay engine and original console come from [autumnsentiment/Trae2api-cn](https://github.com/autumnsentiment/Trae2api-cn) v1.0.4, with its copyright and license retained. This is an independent community integration. Related information: [MIT license](LICENSE) · [Third-party notices](THIRD_PARTY_NOTICES.md) · [Usage boundaries and disclaimer](DISCLAIMER.en.md).
+The relay engine and original console come from [autumnsentiment/Trae2api-cn](https://github.com/autumnsentiment/Trae2api-cn) v1.0.4, with its copyright and license retained. Related information: [MIT license](LICENSE) · [Third-party notices](THIRD_PARTY_NOTICES.md) · [Usage boundaries and disclaimer](DISCLAIMER.en.md).
