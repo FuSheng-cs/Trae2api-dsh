@@ -1,6 +1,8 @@
 # DSH 市场提交记录
 
-记录更新：2026-10-13（北京时间）。项目现名 **Trae2api-dsh**；最新发布见 [GitHub Release](https://github.com/FuSheng-cs/Trae2api-dsh/releases/latest)。以下包含已提交申请及历史验证快照。
+记录更新：2026-10-17（北京时间）。项目现名 **Trae2api-dsh**；最新发布见 [GitHub Release](https://github.com/FuSheng-cs/Trae2api-dsh/releases/latest)。以下包含已提交申请及历史验证快照。
+
+2026-10-17 审核反馈处理：主库条目的中英文描述已补充 Python 3.10+ 与首次联网安装依赖要求（[提交](https://github.com/FuSheng-cs/awesome-dsh-plugin/commit/4c6da49f997257d818e60546b36e9d6ba2f6e144)）。创意工坊条目已补回自动签到与轮询默认关闭，并说明 Python 环境前置（[提交](https://github.com/FuSheng-cs/dsh-community-plugins/commit/48482ac16ac3f583d089286d540e8f06f92ee437)）；简介继续聚焦功能和配置，详细使用说明保留在项目文档，等待维护者确认。DSH Market 已于 2026-10-14 确认 [数据修正 #242](https://github.com/2BingLing/dsh-market/issues/242#issuecomment-6160318118) 应用完成。
 
 **v1.3.1** 已发布：插件介绍统一突出“将 TRAE 账号的模型额度接入 dsh 使用”，市场简介、作者自述与 README 主介绍只描述功能。现有主库、创意工坊、补充注册表及提交材料已更新；DSH Market 的 [修正申请 #242](https://github.com/2BingLing/dsh-market/issues/242) 现同时包含新的功能简介、作者自述与安装命令，线上展示等待市场处理与同步。
 
@@ -14,9 +16,9 @@ v1.2.2 重构了中英文 README，新增详细使用指南与贡献指南，免
 
 | 渠道 | 本次处理 | 提交结果 |
 | --- | --- | --- |
-| awesome-dsh-plugin / dsh-market / dshmarket.com | 已通过年龄、bundle、提交数量门槛与构建检查，继续使用单文件正式 PR，不重复登记。 | [PR #7164](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/pull/7164)，**全部检查通过，待维护者合并**。 |
-| 创意工坊 / dsh-market.com | 原条目已上架，保留原 ID；新名称与规范仓库链接通过单条目更新 PR 同步。 | **已上架，改名待审**：[创意工坊](https://dsh-market.com/) → 插件 → 搜索 `TRAE`；[更新 PR #34](https://github.com/zhu1090093659/dsh-community-plugins/pull/34)，[原合并 PR #31](https://github.com/zhu1090093659/dsh-community-plugins/pull/31)。 |
-| DSH Market / dsh.market | 已上架；原提交材料的功能介绍已更新，通过已有修正申请同步新的简介、作者自述和安装命令。 | **已上架，信息更新待同步**：[插件详情](https://dsh.market/?plugin=FuSheng-cs%2FTrae2api-dsh)，[收录确认 #234](https://github.com/2BingLing/dsh-market/issues/234#issuecomment-6138989624)，[数据修正 #242](https://github.com/2BingLing/dsh-market/issues/242)。 |
+| awesome-dsh-plugin / dsh-market / dshmarket.com | 单文件正式 PR 已按审核反馈补齐 Python 运行时和首次下载依赖说明。 | [PR #7164](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/pull/7164)，**说明已修正，待检查与维护者合并**。 |
+| 创意工坊 / dsh-market.com | 原条目已上架，保留原 ID；改名申请补充默认关闭行为与安装前置，简介仍聚焦功能和配置。 | **已上架，更新待审**：[创意工坊](https://dsh-market.com/) → 插件 → 搜索 `TRAE`；[更新 PR #34](https://github.com/zhu1090093659/dsh-community-plugins/pull/34)，[原合并 PR #31](https://github.com/zhu1090093659/dsh-community-plugins/pull/31)。 |
+| DSH Market / dsh.market | 已上架；功能介绍、作者自述和安装命令的修正已获管道确认，修正 issue 完成关闭。 | **已上架，数据修正完成**：[插件详情](https://dsh.market/?plugin=FuSheng-cs%2FTrae2api-dsh)，[修正确认](https://github.com/2BingLing/dsh-market/issues/242#issuecomment-6160318118)。 |
 | dshplugin.io | 按网站指定的 `plugin-submission` issue 入口提交，现有申请已更新至 Trae2api-dsh v1.3.1 的功能介绍。 | [Issue #34](https://github.com/tjsdyy/dshplugin/issues/34)，待审。 |
 | DSH Hub / dshhub.org | 按仓库提交表单提供仓库、用途和安装方式。 | [Issue #49](https://github.com/coderPerseus/dsh-hub/issues/49)，待审。 |
 | DSH Marketplace / dshmarketplace.dev | 提交表单显示已在目录中，公开 API 返回规范仓库和 `github:FuSheng-cs/Trae2api-dsh` 安装命令；`installable: true`、`installCheck: null`。无需重复投递。 | **已进入目录**：[目录 API](https://dshmarketplace.dev/api/v1/plugins?q=FuSheng-cs%2FTrae2api-dsh&limit=5)，[原申请 #17](https://github.com/DshMarketPlace/awesome-dsh-plugin/issues/17) 已说明确认结果并关闭；不声称完成安装检查或精选审核。 |
